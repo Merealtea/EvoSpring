@@ -88,14 +88,14 @@ class SpringMass(ModelGeneral):
         # in: d_x(used for driven nodes only),type
         # out: d_x
         in_dim = 17 # current_pos, next_pos, mesh_pos, node_vel, node_mass, node_damping, type
-        out_dim = pos_dim
+        out_dim = 2
         self.lagrangian = False
         super(ModelGeneral, self).__init__()
         edge_set_num = 1
 
         self.encode = MLP(in_dim, ld, ld, mlp_hidden_layer, True)
         self.process = SpringMassEvoMesh(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim, self.lagrangian, enhance, agg_conv_pos, edge_set_num)
-        self.temporal_feature_compression = TemporalFeatureAggregation(ld, ld, 3)
+        self.temporal_feature_compression = TemporalFeatureAggregation(ld, ld, 2)
         self.edge_decode = MLP(ld, ld, out_dim, mlp_hidden_layer, False)
         self.MP_times = MP_times
         self.pos_dim = pos_dim
@@ -396,51 +396,33 @@ class SpringMass(ModelGeneral):
         # infer: encode->MP->decode->time integrate to update states
         # out [1, N, 3], the last three dimensions are spring modulus, reset length, dashpot_damping
 
-        # Split node_in by time frames to reduce memory usage
-        batch_size = 4  # Process 4 frames at a time
-        T = node_in.shape[0]  # Total number of time frames
-        edge_features = []
-
-        for i in range(0, T, batch_size):
-            end_idx = min(i + batch_size, T)
-            node_in_batch = node_in[i:end_idx]
-            node_pos_batch = node_pos[i:end_idx]
-            node_vel_batch = node_vel[i:end_idx]
-            
-            _, edge_feature_batch = self._EMD(node_in_batch, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos_batch, node_vel_batch)
-            edge_features.append(edge_feature_batch)
-            
-        # Concatenate all batches
-        edge_feature = torch.cat(edge_features, dim=0)
-
+        _, edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_vel)
 
         # the edge_feature is symmetry
         num_edge = edge_feature.shape[1]
         edge_feature = self.temporal_feature_compression(edge_feature)
 
-        edge_feature = edge_feature[:num_edge//2] \
-            + edge_feature[num_edge//2]
+        edge_feature = edge_feature[:num_edge//2] + edge_feature[num_edge//2]
         
         edge_mech_in_bias = self.edge_decode(edge_feature) 
 
         edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.005
     
         # denormolization
-        edge_mech_in[..., 0] = torch.log(edge_mech_in[..., 0] * (cfg.spring_Y_max - cfg.spring_Y_min) + cfg.spring_Y_min)
+        edge_mech_in[..., 0] = edge_mech_in[..., 0] * (cfg.spring_Y_max - cfg.spring_Y_min) + cfg.spring_Y_min
         edge_mech_in[..., 1] = edge_mech_in[..., 1] * (cfg.object_radius - 2e-5) + 2e-5
 
-        half_edge_mech_in = edge_mech_in_bias + edge_mech_in[0, :num_edge//2]
+        half_edge_mech_in = edge_mech_in_bias + edge_mech_in[:num_edge//2, :2]
 
         c0 = half_edge_mech_in[..., 0]
         c1 = half_edge_mech_in[..., 1]
-        c2 = half_edge_mech_in[..., 2]  # 注意这里维度的匹配
 
         # 2. 对分量进行 Clip (非原位)
-        c0_clipped = torch.log(torch.clip(torch.exp(c0), cfg.spring_Y_min, cfg.spring_Y_max))
+        c0_clipped = torch.log(torch.clip(c0, cfg.spring_Y_min, cfg.spring_Y_max))
         c1_clipped = torch.clip(c1, 2e-5, cfg.object_radius)
 
         # 3. 重新组合 (Stack)
         # 这样生成的是全新的 Tensor，没有原地修改任何历史变量
-        half_edge_mech_in_new = torch.stack([torch.log(c0_clipped), c1_clipped, c2], dim=-1)
+        half_edge_mech_in_new = torch.stack([c0_clipped, c1_clipped], dim=-1)
 
         return half_edge_mech_in_new

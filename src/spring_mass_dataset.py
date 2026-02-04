@@ -59,8 +59,8 @@ class MeshSpringMassDataset(MeshGeneralDataset):
             self.controller_point = np.array(f['controller_point'])
             self.object_visibilities = np.array(f['object_visibilities'])
             self.object_motions_valid = np.array(f['object_motions_valid'])
-            self.node_type = np.array(f["node_type"])
-
+            self.node_type = np.array(f["node_type"])[0:1]
+            
         # 根据SpringMassSystemWarp 类初始化需要的参数从meta中读取所需要的参数
         self.dt = self.meta['dt']
         self.drag_damping = self.meta['drag_damping']
@@ -169,10 +169,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
 
     def _preprocess(self, node_pos, node_vel, node_mass, log_spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping, mode='train'):
         # node_type : 0 object point, 1 surface point, 2 interior point, 3 controller point
-        if mode == "train":
-            node_type = torch.LongTensor(self.node_type[:self.train_frame]).to(node_pos.device)[:-1]
-        else:
-            node_type = torch.LongTensor(self.node_type[self.train_frame:]).to(node_pos.device)[:-1]
+        node_type = torch.LongTensor(self.node_type).to(node_pos.device)
 
         # concat interior feature and controller feature separately
         node_info_inp = node_pos[:-1].clone()
