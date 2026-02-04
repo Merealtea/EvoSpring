@@ -13,76 +13,6 @@ from qqtt.utils import logger, cfg
 This model works for mechanical information estimations of spring-mass systems.
 """
 
-
-class WarpLossFunction(torch.autograd.Function):
-    """
-    桥接 Warp (可微物理模拟) 和 PyTorch (神经网络) 的梯度。
-    """
-
-    @staticmethod
-    def forward(ctx, wp_loss, tape, wp_spring_Y, wp_rest_lengths, torch_spring_Y, torch_rest_lengths):
-        # 1. 保存上下文供 backward 使用
-        # 注意：wp_loss 必须是 warp array，且在此之前已经计算完毕
-        ctx.tape = tape
-        ctx.wp_loss = wp_loss
-        ctx.wp_spring_Y = wp_spring_Y
-        ctx.wp_rest_lengths = wp_rest_lengths
-        
-        # 2. 将 Warp loss 转为 PyTorch tensor
-        # wp.to_torch 返回的 tensor 可能仍在 GPU 上，且需要 detach 以便作为新的叶子节点
-        loss_tensor = wp.to_torch(wp_loss).clone().detach()
-        
-        # 确保是标量，如果 shape 是 (1,) 需要 squeeze
-        if loss_tensor.numel() == 1:
-            loss_tensor = loss_tensor.squeeze()
-            
-        return loss_tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # grad_output 是 PyTorch 传来的 d(FinalLoss)/d(WarpLoss)
-        
-        # 1. 在 Warp 端进行反向传播
-        # 关键修正：必须对 wp_loss 求导，而不是对参数求导
-        ctx.tape.backward(loss=ctx.wp_loss)
-
-        # 2. 获取梯度并应用链式法则
-        grad_spring_Y = None
-        grad_rest_lengths = None
-
-        # 处理弹簧系数梯度
-        if ctx.wp_spring_Y.grad is not None:
-            # 将 Warp 梯度转回 PyTorch
-            # 注意：Warp 的梯度通常累加在 .grad 中，转为 torch 后需要 clone
-            grad_warp = wp.to_torch(ctx.wp_spring_Y.grad).clone()
-            
-            # 链式法则：dL/dx = (dL/d_warp_loss) * (d_warp_loss/dx)
-            # 即：grad_output * warp_grad
-            if grad_output.ndim == 0:
-                grad_spring_Y = grad_warp * grad_output
-            else:
-                # 处理 batch 或维度匹配情况
-                grad_spring_Y = grad_warp * grad_output.view(-1, 1) # 根据实际维度调整
-
-        # 处理静止长度梯度
-        if ctx.wp_rest_lengths.grad is not None:
-            grad_warp = wp.to_torch(ctx.wp_rest_lengths.grad).clone()
-            if grad_output.ndim == 0:
-                grad_rest_lengths = grad_warp * grad_output
-            else:
-                grad_rest_lengths = grad_warp * grad_output.view(-1, 1)
-
-        # 3. 梯度归零 (可选但推荐)
-        # Warp 的 tape 可能会累积梯度，为了安全起见，取完梯度后可以在这里 zero 
-        # 但这取决于你的 Simulator 是否会在每次 step 前 zero_grad。
-        # ctx.wp_spring_Y.grad.zero_() 
-
-        # 4. 返回梯度
-        # 返回值的顺序必须与 forward 的输入参数严格对应
-        # 输入: (ctx, wp_loss, tape, wp_spring_Y, wp_rest_lengths, torch_spring_Y, torch_rest_lengths)
-        # 只需要最后两个 PyTorch Tensor 的梯度
-        return None, None, None, None, grad_spring_Y, grad_rest_lengths
-
 class SpringMass(ModelGeneral):
     def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos):
         # in: d_x(used for driven nodes only),type
@@ -368,17 +298,12 @@ class SpringMass(ModelGeneral):
         return node_info[..., 2*self.pos_dim: 3*self.pos_dim].clone()
 
     def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, vel):
-        if self.temp > 0.1 :
-            self.temp *= self.gamma
-            self.temp = torch.clamp(self.temp, 0.1)
 
         mesh_pos = self._get_mesh_pos(node_feature)[0]
         node_feature = self._get_nodal_latent_input(node_feature)
 
         # TODO: Generate edge features for spring-mass system if needed
         x = self.encode(node_feature)
-        if torch.isnan(x).any():
-            import pdb; pdb.set_trace()
 
         for _ in range(self.MP_times):
             x, edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, vel, self.temp, mesh_pos)
@@ -386,7 +311,11 @@ class SpringMass(ModelGeneral):
         return x, edge_feature
         
     
-    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, node_tar, pen_coeff=None):
+    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, node_tar, pen_coeff=None, prev_edge_feature=None):
+        if self.temp > 0.1 :
+            self.temp *= self.gamma
+            self.temp = torch.clamp(self.temp, 0.1)
+            
         # get mat pos and type
         node_pos, node_vel, node_type = self._get_pos_type(node_in)
 
@@ -396,35 +325,39 @@ class SpringMass(ModelGeneral):
         # infer: encode->MP->decode->time integrate to update states
         # out [1, N, 3], the last three dimensions are spring modulus, reset length, dashpot_damping
 
-        # Split node_in by time frames to reduce memory usage
-        batch_size = 4  # Process 4 frames at a time
+        # RNN-style frame-by-frame processing
         T = node_in.shape[0]  # Total number of time frames
-        edge_features = []
 
-        for i in range(0, T, batch_size):
-            end_idx = min(i + batch_size, T)
-            node_in_batch = node_in[i:end_idx]
-            node_pos_batch = node_pos[i:end_idx]
-            node_vel_batch = node_vel[i:end_idx]
-            
-            _, edge_feature_batch = self._EMD(node_in_batch, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos_batch, node_vel_batch)
-            edge_features.append(edge_feature_batch)
-            
-        # Concatenate all batches
-        edge_feature = torch.cat(edge_features, dim=0)
+        # Process each frame sequentially
+        for t in range(T):
+            # Get current frame data
+            node_in_frame = node_in[t:t+1]  # Shape: (1, num_nodes, feature_dim)
+            node_pos_frame = node_pos[t:t+1]
+            node_vel_frame = node_vel[t:t+1]
 
+            # Process current frame through EMD
+            _, edge_feature_frame = self._EMD(node_in_frame, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos_frame, node_vel_frame)
+
+            # Fusion: Add previous frame's edge feature to current frame (RNN-style)
+            if prev_edge_feature is not None:
+                edge_feature_frame = edge_feature_frame + prev_edge_feature
+
+            # Update prev_edge_feature for next iteration
+            prev_edge_feature = edge_feature_frame
+
+        # Use the last frame's edge feature for final prediction
+        edge_feature = edge_feature_frame
 
         # the edge_feature is symmetry
         num_edge = edge_feature.shape[1]
-        edge_feature = self.temporal_feature_compression(edge_feature)
 
-        edge_feature = edge_feature[:num_edge//2] \
-            + edge_feature[num_edge//2]
-        
-        edge_mech_in_bias = self.edge_decode(edge_feature) 
+        # Average symmetric edges
+        edge_feature = edge_feature[:, :num_edge//2] + edge_feature[:, num_edge//2:]
+
+        edge_mech_in_bias = self.edge_decode(edge_feature.squeeze(0))  # Remove time dimension
 
         edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.005
-    
+
         # denormolization
         edge_mech_in[..., 0] = torch.log(edge_mech_in[..., 0] * (cfg.spring_Y_max - cfg.spring_Y_min) + cfg.spring_Y_min)
         edge_mech_in[..., 1] = edge_mech_in[..., 1] * (cfg.object_radius - 2e-5) + 2e-5
@@ -441,6 +374,6 @@ class SpringMass(ModelGeneral):
 
         # 3. 重新组合 (Stack)
         # 这样生成的是全新的 Tensor，没有原地修改任何历史变量
-        half_edge_mech_in_new = torch.stack([torch.log(c0_clipped), c1_clipped, c2], dim=-1)
+        half_edge_mech_in_new = torch.stack([c0_clipped, c1_clipped, c2], dim=-1)
 
         return half_edge_mech_in_new

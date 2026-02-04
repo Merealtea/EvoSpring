@@ -14,12 +14,8 @@ import numpy as np
 import os
 from qqtt.utils import logger, cfg
 import warp as wp
-import gc  # 记得在文件头部导入
 import os
 from time import time
-# 3. 如果是 OffscreenRenderer，无头模式仍需保留
-os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-os.environ["GALLIUM_DRIVER"] = "llvmpipe"
 
 @wp.kernel
 def accum_loss_kernel(loss_accum: wp.array(dtype=float), frame_loss: wp.array(dtype=float)):
@@ -324,9 +320,6 @@ class SpringMassTrainer:
         mean_loss_insts = 0
         count_insts = 0
 
-        # single step simulation
-        
-
         # optimization
         self.optimizer.zero_grad()
 
@@ -409,7 +402,7 @@ class SpringMassTrainer:
             # 注意：如果 Warp 梯度为 None (未参与计算)，则设为 0
             grad_spring_Y = wp.to_torch(wp_predicted_spring_Y.grad).clone() if wp_predicted_spring_Y.grad else torch.zeros_like(predicted_spring_Y)
             grad_rest_length = wp.to_torch(wp_predicted_rest_length.grad).clone() if wp_predicted_rest_length.grad else torch.zeros_like(predicted_rest_length)
-            
+
             # 3. 将梯度手动注入 PyTorch 计算图
             # 我们对模型输出的 predicted_spring_Y 调用 backward，并传入 Warp 算出的梯度
             torch.autograd.backward(
@@ -421,9 +414,6 @@ class SpringMassTrainer:
             self.optimizer.step()
             print(f"Elas Grad: {self.torch_collide_elas.grad}")
             print(f"Elas Grad: {self.torch_collide_fric.grad}")
-            print(f"Elas Grad: {self.torch_collide_object_elas.grad}")
-            print(f"Elas Grad: {self.torch_collide_object_fric.grad}")
-            import pdb; pdb.set_trace()
             
         else:
             # 验证模式不需要 tape
@@ -471,7 +461,6 @@ class SpringMassTrainer:
 
         for epoch in self.pbar:
             mean_loss_train, mech_info = self.run_epoch(epoch, 
-                                                        mech_info,
                                                         'train')
 
             with torch.autograd.no_grad():

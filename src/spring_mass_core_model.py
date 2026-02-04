@@ -91,6 +91,7 @@ class spring_mass_amp(MessagePassing):
         logits = torch.mean(logits, axis=0)
         
         hard = True
+   
         y_soft, y_hard = gumbel_softmax(logits, temp, hard=hard)  # tau越小越接近one-hot
 
         return self.mlp_node_delta(tmp) + x, edge_weight, y_hard
