@@ -54,9 +54,6 @@ def getargs():
     parser.add_argument('-restart_epoch', type=int, default=-1, help='restart checkpoint epoch')
     
     parser.add_argument('-object_case', type=str, default=-1, help='target object for optimization')
-    parser.add_argument('-train_frame', type=int, default=-1, help='frames used for mechanical info estimation')
-    parser.add_argument('-test_frame', type=int, default=-1, help='frames used for mechanical info examination')
-
     args, _ = parser.parse_known_args()
     return args
 
@@ -74,7 +71,8 @@ if __name__ == "__main__":
     seed_everything(0)
     args = getargs()
     args.consist_mesh = bool(args.consist_mesh)
-    args.dump_dir = os.path.join(args.dump_dir, 'ours')
+    # Use case name as the subdirectory instead of hardcoded 'ours'
+    args.dump_dir = os.path.join(args.dump_dir, args.object_case)
     print(args)
     torch.cuda.set_device(args.local_rank)
     torch.distributed.init_process_group(backend='nccl')

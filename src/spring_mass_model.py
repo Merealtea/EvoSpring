@@ -87,7 +87,7 @@ class SpringMass(ModelGeneral):
     def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos):
         # in: d_x(used for driven nodes only),type
         # out: d_x
-        in_dim = 17 # current_pos, next_pos, mesh_pos, node_vel, node_mass, node_damping, type
+        in_dim = 20 # current_pos, next_pos, mesh_pos, node_vel, node_mass, node_damping, type
         out_dim = 2
         self.lagrangian = False
         super(ModelGeneral, self).__init__()
@@ -143,7 +143,7 @@ class SpringMass(ModelGeneral):
         self.init_springs = torch.tensor(init_springs.T, dtype=torch.int32).contiguous().to(device)
         self.init_rest_lengths = torch.FloatTensor(init_rest_lengths).contiguous().to(device)
         self.init_masses = torch.FloatTensor(init_masses).contiguous().to(device)
-        self.init_spring_Y = torch.FloatTensor(init_spring_Y).contiguous().to(device)
+        self.init_spring_Y = init_spring_Y
         self.object_visibilities = torch.FloatTensor(object_visibilities).contiguous().to(device)
         self.object_motions_valid = torch.FloatTensor(object_motions_valid).contiguous().to(device)
         self.init_velocities = torch.FloatTensor(init_velocities).contiguous().to(device)
@@ -176,11 +176,11 @@ class SpringMass(ModelGeneral):
             self.init_masses,
             dt=self.dt,
             num_substeps=self.num_substeps,
-            spring_Y=self.init_spring_Y,
+            spring_Y=self.init_spring_Y, 
             collide_elas=self.collide_elas, 
             collide_fric=self.collide_fric, 
-            dashpot_damping=self.dashpot_damping,
-            drag_damping=self.drag_damping,
+            dashpot_damping=int(self.dashpot_damping), # DEBUG
+            drag_damping=int(self.drag_damping), # DEBUG
             collide_object_elas=self.collide_object_elas,
             collide_object_fric=self.collide_object_fric,
             init_masks=init_masks,
@@ -193,9 +193,9 @@ class SpringMass(ModelGeneral):
             reverse_z=self.reverse_z,
             spring_Y_min=self.spring_Y_min,
             spring_Y_max=self.spring_Y_max,
-            gt_object_points=self.object_points, # DEBUG
-            gt_object_visibilities=self.object_visibilities,
-            gt_object_motions_valid=self.object_motions_valid,
+            gt_object_points=self.object_points, 
+            gt_object_visibilities=self.object_visibilities.bool(),
+            gt_object_motions_valid=self.object_motions_valid.bool(),
             self_collision=self.self_collision,
         )
 
@@ -326,8 +326,8 @@ class SpringMass(ModelGeneral):
             )
 
     def _get_pos_type(self, node_in):
-        # 0:3 current_pos, 3:6 next_pos 6:9 mesh_pos, 9:12 node_vel 12:13 node_mass 13:16 node_damping, 16: type
-        pos_mat_world = node_in[..., :self.pos_dim] 
+        # 0:3 current_pos, 3:6 next_pos 6:9 node_vel 9:12 unnormalized_pos 12:13 node_mass 13:16 node_damping, 16: type
+        pos_mat_world = node_in[..., self.pos_dim:self.pos_dim * 2] 
 
         vel_mat_world = self._get_vel(node_in)
         # torch.cat((node_in[..., self.pos_dim:2 * self.pos_dim], node_in[..., :self.pos_dim]), dim=-1)
@@ -335,7 +335,7 @@ class SpringMass(ModelGeneral):
         return pos_mat_world, vel_mat_world, node_type
 
     def _get_vel(self, node_in):
-        return node_in[..., self.pos_dim * 3 : self.pos_dim * 4]
+        return node_in[..., self.pos_dim * 2 : self.pos_dim * 3]
 
     def _update_states(self, node_in, node_tar, node_type, out):
         vel = self._get_vel(node_in)
@@ -364,65 +364,58 @@ class SpringMass(ModelGeneral):
         # in_dim for nodal encoding: [world, mesh_pos, node_mass, velocity, node_damping, type] out of [world, mesh_pos, node_mass, velocity, node_damping, type]
         return node_in.clone()
     
-    def _get_mesh_pos(self, node_info):
-        return node_info[..., 2*self.pos_dim: 3*self.pos_dim].clone()
+    def _get_pos(self, node_info):
+        return node_info[..., self.pos_dim: self.pos_dim].clone()
 
-    def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, vel):
+    def _EMD(self, node_feature, edge_feature, m_ids, multi_gs, m_gs_parent, pos, vel):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
 
-        mesh_pos = self._get_mesh_pos(node_feature)[0]
+        # pos = self._get_pos(node_feature)[0]
         node_feature = self._get_nodal_latent_input(node_feature)
 
         # TODO: Generate edge features for spring-mass system if needed
         x = self.encode(node_feature)
-        if torch.isnan(x).any():
-            import pdb; pdb.set_trace()
 
         for _ in range(self.MP_times):
-            x, edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, vel, self.temp, mesh_pos)
+            x, edge_feature = self.process(x, edge_feature, m_ids, multi_gs, m_gs_parent, pos, vel, self.temp)
 
         return x, edge_feature
         
     
-    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, node_tar, pen_coeff=None):
+    def forward(self, 
+                m_idx, 
+                m_gs, 
+                m_gs_parent, 
+                node_in, 
+                edge_in, 
+                pen_coeff=None,
+                ):
         # get mat pos and type
         node_pos, node_vel, node_type = self._get_pos_type(node_in)
 
         # preprocess: set scripted bcs
-        node_in = self._pre(node_in, node_tar, node_type)
+        # node_in = self._pre(node_in, node_tar, node_type)
 
         # infer: encode->MP->decode->time integrate to update states
         # out [1, N, 3], the last three dimensions are spring modulus, reset length, dashpot_damping
 
-        _, edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_vel)
+        _, edge_feature = self._EMD(node_in, edge_in, m_idx, m_gs, m_gs_parent, node_pos, node_vel)
 
+        edge_feature = edge_feature
         # the edge_feature is symmetry
-        num_edge = edge_feature.shape[1]
         edge_feature = self.temporal_feature_compression(edge_feature)
 
+        num_edge = edge_feature.shape[0]
+        
         edge_feature = edge_feature[:num_edge//2] + edge_feature[num_edge//2]
         
         edge_mech_in_bias = self.edge_decode(edge_feature) 
 
-        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.005
-    
-        # denormolization
-        edge_mech_in[..., 0] = edge_mech_in[..., 0] * (cfg.spring_Y_max - cfg.spring_Y_min) + cfg.spring_Y_min
-        edge_mech_in[..., 1] = edge_mech_in[..., 1] * (cfg.object_radius - 2e-5) + 2e-5
+        edge_in[..., -2] = torch.exp(edge_in[..., -2])
 
-        half_edge_mech_in = edge_mech_in_bias + edge_mech_in[:num_edge//2, :2]
+        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 500
+        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.000001
 
-        c0 = half_edge_mech_in[..., 0]
-        c1 = half_edge_mech_in[..., 1]
-
-        # 2. 对分量进行 Clip (非原位)
-        c0_clipped = torch.log(torch.clip(c0, cfg.spring_Y_min, cfg.spring_Y_max))
-        c1_clipped = torch.clip(c1, 2e-5, cfg.object_radius)
-
-        # 3. 重新组合 (Stack)
-        # 这样生成的是全新的 Tensor，没有原地修改任何历史变量
-        half_edge_mech_in_new = torch.stack([c0_clipped, c1_clipped], dim=-1)
-
-        return half_edge_mech_in_new
+        return edge_mech_in_bias

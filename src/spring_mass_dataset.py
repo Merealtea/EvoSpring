@@ -8,19 +8,18 @@ import numpy as np
 import h5py
 import json
 import pickle
+from qqtt.utils import logger, cfg
 
 class MeshSpringMassDataset(MeshGeneralDataset):
     def __init__(self, root, layer_num, stride, mode='train', noise_shuffle=False, noise_level=None, noise_gamma=1.0, 
                  refine_steps=[], recal_mesh=False, consist_mesh=False, 
-                 object_case=None, train_frame=None, test_frame=None, args=None):
+                 object_case=None, args=None):
         in_normal_feature_list, out_normal_feature_list, roll_normal_feature_list = ['world_pos', 'velocities'], ['world_pos'], ['world_pos', 'velocities']
         # NOTE instance_id for a specific transient seq; each instance is in shape T,N,F
 
         self.mode = mode
         self.object_case = args.object_case
         self.data_dir = os.path.join(root, object_case)
-        self.train_frame = train_frame
-        self.test_frame = test_frame
 
         self.layer_num = layer_num
         self.recal_mesh = recal_mesh
@@ -38,8 +37,8 @@ class MeshSpringMassDataset(MeshGeneralDataset):
 
         # read all features indicated in meta
         with open(os.path.join(self.data_dir, 'meta.json'), 'r') as fp:
-            self.meta = json.loads(fp.read())
-        field_names = self.meta['field_names']
+            meta = json.loads(fp.read())
+        field_names = meta['field_names']
         fields = dict()
         with h5py.File(os.path.join(self.data_dir, 'init_spring_mass.h5'), 'r') as f:
             for name in field_names:
@@ -51,7 +50,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
 
             self.object_point = np.array(f['object_points'])
             self.mesh_pos = np.array(f['mesh_pos'])[0]
-            self.spring_Y = np.array(f['init_spring_Y'])[0]
+            self.init_spring_Y = np.array(f['init_spring_Y'])
             self.spring_reset_length = np.array(f['spring_reset_length'])[0,:,0]
             self.spring_dashpot_damping = np.array(f['spring_dashpot_damping'])[0,:,0]
             self.masses = np.array(f['mass'])[0,:,0]
@@ -62,17 +61,26 @@ class MeshSpringMassDataset(MeshGeneralDataset):
             self.node_type = np.array(f["node_type"])[0:1]
             
         # 根据SpringMassSystemWarp 类初始化需要的参数从meta中读取所需要的参数
-        self.dt = self.meta['dt']
-        self.drag_damping = self.meta['drag_damping']
-        self.collide_object_elas = self.meta['collide_object_elas']
-        self.collide_object_fric = self.meta['collide_object_fric']
-        self.collide_elas = self.meta['collide_elas']
-        self.collide_fric = self.meta['collide_fric']
-        self.collision_dist = self.meta['collision_dist']
-        self.dashpot_damping = self.meta['dashpot_damping']
-        self.num_object_points = self.meta['num_object_points']
-        self.num_surface_points = self.meta['num_surface_points']
-        self.num_original_points = self.meta['num_original_points']
+        self.dt = meta['dt']
+        self.drag_damping = meta['drag_damping']
+        self.collide_object_elas = meta['collide_object_elas']
+        self.collide_object_fric = meta['collide_object_fric']
+        self.collide_elas = meta['collide_elas']
+        self.collide_fric = meta['collide_fric']
+        self.collision_dist = meta['collision_dist']
+        self.dashpot_damping = meta['dashpot_damping']
+        self.num_object_points = meta['num_object_points']
+        self.num_surface_points = meta['num_surface_points']
+        self.num_original_points = meta['num_original_points']
+        self.controller_radius = meta['controller_radius']
+        self.object_radius = meta['object_radius']
+        self.normalization_info = meta['normalization_info']
+        self.train_frame = meta['train_frame']
+        self.test_frame = meta['test_frame'] - meta['train_frame']
+
+        self.spring_Y_max = cfg.spring_Y_max
+        self.spring_Y_min = cfg.spring_Y_min
+        self.max_radius = max(self.object_radius, self.controller_radius)
 
         # read normalization info
         self._read_normalization_info(in_normal_feature_list, out_normal_feature_list, roll_normal_feature_list)
@@ -89,12 +97,44 @@ class MeshSpringMassDataset(MeshGeneralDataset):
         self.stride = stride
         self.strided_idx = list(range(0, fields["mesh_pos"].shape[0], stride))
         self.L = len(self.strided_idx) - 1
-        for name in field_names:
-            fields[name] = fields[name][self.strided_idx]
+
+        
+        # for name in field_names:
+        #     fields[name] = fields[name][self.strided_idx]
        
         self._cal_multi_mesh()
         super(MeshGeneralDataset,self).__init__(root)
         self.L = self.L - 1
+
+    def _read_normalization_info(self, in_normal_feature_list, out_normal_feature_list, roll_normal_feature_list):
+        # collect in normalization
+        for i, fea in enumerate(in_normal_feature_list):
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
+            temp_mean = torch.tensor(self.normalization_info[fea]['mean'], dtype=torch.float)
+            if i == 0:
+                self.std_in = temp_std
+                self.mean_in = temp_mean
+            else:
+                self.std_in = torch.cat((self.std_in, temp_std), dim=-1)
+                self.mean_in = torch.cat((self.mean_in, temp_mean), dim=-1)
+        # collect out normalization
+        for i, fea in enumerate(out_normal_feature_list):
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
+            temp_mean = torch.tensor(self.normalization_info[fea]['mean'], dtype=torch.float)
+            if i == 0:
+                self.std_out = temp_std
+                self.mean_out = temp_mean
+            else:
+                self.std_out = torch.cat((self.std_out, temp_std), dim=-1)
+                self.mean_out = torch.cat((self.mean_out, temp_mean), dim=-1)
+        # collect roll-out normalization
+        self.roll_l = 0
+        for i, fea in enumerate(roll_normal_feature_list):
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
+            self.roll_l += temp_std.shape[-1]
+        # NOTE assume/let all leading features align with the list ordering here
+        self.in_norm_l = 3
+        self.out_norm_l = 3
 
     def get(self, idx):
         # idx in time seq (enhanced by noise shuffle)
@@ -125,6 +165,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
             else:
                 mmfile = os.path.join(self.data_dir, self.object_case + '_mmesh_layer_' + str(self.layer_num) + '.dat')
             mmexist = os.path.isfile(mmfile)
+          
             if self.recal_mesh or not mmexist:
                 if self.mesh_type == MeshType.Triangle:
                     edge_i = triangles_to_edges(self.cells)
@@ -157,27 +198,69 @@ class MeshSpringMassDataset(MeshGeneralDataset):
         self.recal_mesh = False
         return 
 
-    def _normalize(self, t_in, t_out):
-        device = t_in.device
-        x_in = t_in.clone()
-        x_out = t_out.clone()
+    def _normalize(self, node_pos, edge_spring, spring_rest_length):
+        device = node_pos.device
+        node_pos = node_pos.clone()
 
-        x_in[..., :self.in_norm_l] = (x_in[..., :self.in_norm_l] - self.mean_in.to(device)) / self.std_in.to(device)
-        x_in[..., 2*self.in_norm_l:3*self.in_norm_l] = (x_in[..., 2*self.in_norm_l:3*self.in_norm_l] - self.mean_in.to(device)) / self.std_in.to(device)
-        x_out[..., :self.out_norm_l] = (x_out[..., :self.out_norm_l] - self.mean_out.to(device)) / self.std_out.to(device)
-        return x_in, x_out
+        node_pos[..., :self.in_norm_l] = (node_pos[..., :self.in_norm_l] - self.mean_in[None, :self.in_norm_l].to(device)) / self.std_in[None, :self.in_norm_l].to(device)
+        edge_spring = (torch.exp(edge_spring) - self.spring_Y_min) / (self.spring_Y_max - self.spring_Y_min)
 
-    def _preprocess(self, node_pos, node_vel, node_mass, log_spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping, mode='train'):
-        # node_type : 0 object point, 1 surface point, 2 interior point, 3 controller point
-        node_type = torch.LongTensor(self.node_type).to(node_pos.device)
+        spring_rest_length = spring_rest_length / self.max_radius
 
-        # concat interior feature and controller feature separately
-        node_info_inp = node_pos[:-1].clone()
-        node_info_tar = node_pos[1:].clone()  # this is the final target
-        node_vel = node_vel[:-1].clone()
+        return node_pos, edge_spring, spring_rest_length
+    
+    def _denormalize(self, node_pos, edge_spring, spring_rest_length):
+        device = node_pos.device
+        node_pos = node_pos.clone()
+
+        node_pos[..., :self.out_norm_l] = node_pos[..., :self.out_norm_l] * self.std_out.to(device) + self.mean_out.to(device)
+        edge_spring = edge_spring * (self.spring_Y_max - self.spring_Y_min) + self.spring_Y_min
+        
+        spring_rest_length = spring_rest_length * self.max_radius
+        return node_pos, edge_spring, spring_rest_length
+
+    def _preprocess(self, node_pos, node_vel, node_mass, 
+                    log_spring_Y, spring_rest_length, 
+                    drag_damping, 
+                    spring_force, dashpot_force, overall_forces, 
+                    device, mode='train'):
+        T, num_node, geo_dim = node_pos.shape
+
+        # normalization for node_pos 和 log_spring_Y, spring_reset_length
+        # TODO : add normalization for edge features
+
+        node_pos, spring_Y, spring_rest_length = self._normalize(node_pos, 
+                                                       log_spring_Y, 
+                                                       spring_rest_length)
 
         # recalculate it for surface and interior nodes later
         node_damping = (node_vel * drag_damping).clone()
+
+        # node_type : 0 object point, 1 surface point, 2 interior point, 3 controller point
+        node_type = torch.LongTensor(self.node_type).to(node_pos.device)
+
+        # concat historical position and velocity of every node together as input, and the target is the next step position, velocity is optional to predict
+        node_info = torch.cat((node_pos, node_vel, node_damping), dim=-1)
+        
+        node_info_his = node_info[:-1]
+        node_info_tar = node_info[1:]
+
+        node_inp_info = torch.cat([node_info_his, node_info_tar], dim=-1)
+     
+        node_mass = node_mass[None, :, None].repeat(T-1, 1, 1)
+        node_type = node_type.repeat(T-1, 1, 1)
+
+        # [node_pos, node_vel] * T, node_ 12:13 node_mass 13:16 node_damping, 16: type
+        node_inp_info = torch.cat((node_inp_info, node_mass, node_type), dim=-1)
+
+        # concat spring_Y, spring_reset_length, dashpot_damping as edge features, and repeat for both directions
+        edge_in_info = torch.cat((spring_force, dashpot_force), dim=-1)[:-1]
+
+        spring_Y = spring_Y[None, :].repeat(T-1, 1, 1)
+        spring_rest_length = spring_rest_length[None, :].repeat(T-1, 1, 1)
+        # spring_dashpot_damping = torch.ones_like(spring_Y) * self.dashpot_damping  
+        
+        edge_in_info = torch.cat((edge_in_info, spring_Y, spring_rest_length), dim = -1)
 
         # enhance by noise level
         if self.noise_shuffle:
@@ -189,32 +272,12 @@ class MeshSpringMassDataset(MeshGeneralDataset):
 
             # for dirichelet nodes, the noise is zero
             noise = torch.where(no_noise_node, torch.zeros_like(noise), noise)
-            node_info_inp += noise
+            node_inp_info += noise
             node_info_tar += (1.0 - self.noise_gamma) * noise
 
-        T = node_type.shape[0]
-        # 0:3 current_pos, 3:6 next_pos, 6:9 mesh_pos, 9:12 node_vel 12:13 node_mass 13:16 node_damping, 16: type
-        node_mesh = torch.FloatTensor(self.mesh_pos[None].repeat(T, axis=0)).to(node_info_tar.device)
-        node_mass = node_mass[None, :, None].repeat(T, 1, 1)
-
-        node_info_inp = torch.cat((node_info_inp, torch.zeros_like(node_info_tar), 
-                                   node_vel, node_mesh, node_mass, 
-                                   node_damping, node_type), dim=-1)
-
-        
-        spring_Y_max, spring_Y_min = 1e5, 0
-
-        spring_Y = (torch.exp(log_spring_Y) - spring_Y_min) / (spring_Y_max - spring_Y_min)
-
-        spring_reset_length_max, spring_reset_length_min = 0.02, 2e-5
-        spring_reset_length = (spring_reset_length - spring_reset_length_min) / (spring_reset_length_max - spring_reset_length_min)
-
-        # 0: edge_init_spring, 1: edge_init_reset_length, 2: edge_init_dashpot_damping
-        edge_mech_info_inp = torch.stack((spring_Y, spring_reset_length, spring_dashpot_damping * torch.ones_like(spring_reset_length)), dim=-1)
-        edge_mech_info_inp = torch.cat([edge_mech_info_inp, edge_mech_info_inp], dim=0)
-
-        # TODO : add normalization for edge features
-        self.in_feature, self.tar_feature = self._normalize(node_info_inp, node_info_tar)
+        # Load data to GPU
+        node_inp_info = node_inp_info.to(device)
+        edge_in_info = edge_in_info.to(device)
 
         # Input, and target, but in our case, we have to targets, one for node position and velocity, another egde prediction
-        return node_info_inp, edge_mech_info_inp, node_info_tar
+        return node_inp_info, edge_in_info

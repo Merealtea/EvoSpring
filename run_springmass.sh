@@ -4,6 +4,7 @@ CONFIG_FILE="${2-./configs/$CASE/}"
 # 0: train 1: local test 2: global
 MODE="${3-0}"
 RESTART_EPOCH="${4--1}"
+local_rank=1
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "No config file for ${CASE} in configs folder"
@@ -17,7 +18,7 @@ cp $CONFIG_FILE $dump_dir
 #  
 run(){
     python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
-    -case $CASE -space_dim $space_dim \
+    -case $CASE -space_dim $space_dim -local_rank $local_rank \
     -n_train $n_train -n_valid $n_valid -n_test $n_test -time_len $time_len\
     -noise_level $noise_level \
     -multi_mesh_layer $multi_mesh_layer -consist_mesh $consist_mesh\

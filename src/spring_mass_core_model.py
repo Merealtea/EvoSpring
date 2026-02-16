@@ -22,7 +22,7 @@ class spring_mass_amp(MessagePassing):
         # + 2 * pos_dim +2 for lagrangian (dir and norm_w and norm_m)
         # + 2 * pos_dim for vel_diff
         # + 3 for init_length, spring_Y and dashpot_damping
-        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 * pos_dim + 2 + 3 if lagrangian else 2 * latent_dim + pos_dim + pos_dim + 1 + 3
+        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 * pos_dim + 2 + 3 if lagrangian else 2 * latent_dim + pos_dim + pos_dim + 3 + 6
         self.weightnet = True
         if self.weightnet:
             self.mlp_edge_info = MLP(edge_info_in_len, latent_dim, latent_dim, hidden_layer, True)
@@ -60,6 +60,7 @@ class spring_mass_amp(MessagePassing):
             raise NotImplementedError("Only implemented for dim 2 and 3")
         dir = pi - pj  # in shape (T),N,dim
         vel_diff = vi - vj
+        
 
         if self.lagrangian:
             norm_w = torch.norm(dir[..., :self.pos_dim], dim=-1, keepdim=True)  # in shape (T),N,1
@@ -99,7 +100,7 @@ class spring_mass_amp_base(MessagePassing):
     def __init__(self, latent_dim, hidden_layer, pos_dim, lagrangian):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp_node_delta = MLP(2 * latent_dim, latent_dim, latent_dim, hidden_layer, True)
-        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 + 3 if lagrangian else 2 * latent_dim + 2*pos_dim + 1 +3
+        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 + 3 if lagrangian else 2 * latent_dim + 2 * pos_dim + 3 + 6
         self.mlp_edge_info = MLP(edge_info_in_len, latent_dim, latent_dim, hidden_layer, True)
         self.mlp_edge_weight = Seq(*[MLP(latent_dim, latent_dim, 1, hidden_layer, False)])
         self.lagrangian = lagrangian
@@ -181,21 +182,41 @@ class SpringMassEvoMesh(EvoMesh):
             self.unpools.append(Unpool())
         self.esn = edge_set_num
         self.lagrangian = lagrangian
+    
+    def pool_edge(self, g, idx, num_nodes, num_orignal_edge):
+        idx = idx.to(torch.long)
+        idx_new_valid = torch.arange(len(idx), dtype=torch.long, device=g.device)
+        idx_new_all = -1 * torch.ones(num_nodes, dtype=torch.long, device=g.device)
+        idx_new_all[idx] = idx_new_valid
+        new_g = -1 * torch.ones_like(g, dtype=torch.long, device=g.device)
+        new_g[0] = idx_new_all[g[0]]
+        new_g[1] = idx_new_all[g[1]]
 
-    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, vel, temp=0.1, weights=None):
+        # new_g[:, :num_orignal_edge] is the original edge
+        both_valid = (new_g[0] >= 0) & (new_g[1] >= 0)
+        e_idx = torch.where(both_valid)[0]
+
+        original_valid = e_idx[e_idx < num_orignal_edge]
+        new_g = new_g[:, e_idx]
+
+        new_edge_parent = torch.full((new_g.shape[1], 1), -1, dtype=torch.long, device=g.device)
+        new_edge_parent[:len(original_valid)] = torch.arange(num_orignal_edge, dtype=torch.long, device=g.device).unsqueeze(-1)[original_valid]
+        return new_g, new_edge_parent
+
+    def forward(self, node_in, edge_in, mm_ids, mm_gs, mm_gs_parent, pos, vel, temp=0.1, weights=None):
         # node_in is in shape of (T), N, F
         # if edge_set_num>1, then m_g is in shape: Level,(Set),2,Edges, the 0th Set is main/material graph
         # pos is in (T),N,D
 
         down_outs = []
         down_ps = []
-        multi_level_edge_mech_info = []
+        multi_level_spring_force_info = []
         cts = []
+        
+        # w = pos.new_ones((pos.shape[-2], 1)) if weights is None else weights
 
-        w = pos.new_ones((pos.shape[-2], 1)) if weights is None else weights
-        T = node_in.shape[0]
-
-        temporal_edge_mech_in = edge_mech_in[None].repeat(T, 1, 1)
+        # # compute force
+        # spring_force = 
         
         # mm_ids is node kept in current layer
         # mm_gs is the edge connection
@@ -206,9 +227,10 @@ class SpringMassEvoMesh(EvoMesh):
 
         # down pass
         l_n = self.l_n 
+        num_nodes_list = []
         for i in range(l_n):
             num_nodes = node_in.shape[-2] if i == 0 else len(m_ids[i-1]) #.shape[0]
-     
+            num_nodes_list.append(num_nodes)
             # # We don't need node self loop right now
             # if self.esn > 1:
             #     gs = []
@@ -219,22 +241,19 @@ class SpringMassEvoMesh(EvoMesh):
             #     gs, _ = add_remaining_self_loops(m_gs[i]) 
 
             gs = m_gs[i]
-            multi_level_edge_mech_info.append(temporal_edge_mech_in)
-
-            if torch.isnan(node_in).any():
-                import pdb; pdb.set_trace()
+            multi_level_spring_force_info.append(edge_in)
 
             if i < self.pre_l_n:
-                node_in, ew, _ = self.down_gmps[i](node_in, temporal_edge_mech_in, gs, pos, vel)
+                node_in, ew, _ = self.down_gmps[i](node_in, edge_in, gs, pos, vel)
                 if i == 0 and self.lagrangian:
-                    node_in, ew = self.down_gmps[i](node_in, temporal_edge_mech_in, gs, pos, vel)
+                    node_in, ew = self.down_gmps[i](node_in, edge_in, gs, pos, vel)
                 y_hard = None
             else:
                 # deeper downsample
                 # dowmsample more to make the network more compact
-                node_in, ew, y_hard = self.down_gmps[i](node_in, temporal_edge_mech_in, gs, pos, vel, temp)
+                node_in, ew, y_hard = self.down_gmps[i](node_in, edge_in, gs, pos, vel, temp)
                 if i == 0 and self.lagrangian:
-                    node_in, ew, y_hard = self.down_gmps[i](node_in, temporal_edge_mech_in, gs, pos, vel, temp)
+                    node_in, ew, y_hard = self.down_gmps[i](node_in, edge_in, gs, pos, vel, temp)
                 N = node_in.shape[1]
                 edge_index = m_gs[i]
                 if self.enhance:
@@ -246,68 +265,10 @@ class SpringMassEvoMesh(EvoMesh):
                     edge_index2 = edge_index
                 
                 m_idx = (y_hard[..., 0] == 1).nonzero().unique()
-                
-                g = self.pool_edge(edge_index2, m_idx, num_nodes=num_nodes)
-                g, _ = coalesce(g, None, num_nodes=len(m_idx))
+                num_original_edge = edge_index.shape[1]
 
-                # Generate m_gs_parent by mapping g to gs
-                gs_parent_new = torch.full((g.shape[1], 2), -1, dtype=torch.long, device=g.device)
-
-                # For each edge in g, find corresponding edge(s) in gs
-                # Sparse version using torch_geometric utilities to avoid dense matrices
-
-                # Map back to original node indices
-                src_nodes = g[0]  # shape: (num_edges,)
-                tgt_nodes = g[1]  # shape: (num_edges,)
-                src_orig = m_idx[src_nodes]  # shape: (num_edges,)
-                tgt_orig = m_idx[tgt_nodes]  # shape: (num_edges,)
-
-                # Create edge tuples for efficient lookup
-                # Use hash-based lookup instead of dense matrix
-                num_g_edges = g.shape[1]
-                num_gs_edges = gs.shape[1]
-
-                # Build a dictionary mapping (src, tgt) -> edge_idx in gs
-                gs_edge_dict = {}
-                for edge_idx in range(num_gs_edges):
-                    key = (gs[0, edge_idx].item(), gs[1, edge_idx].item())
-                    if key not in gs_edge_dict:
-                        gs_edge_dict[key] = edge_idx
-
-                # Find direct edges using hash lookup
-                for g_edge_idx in range(num_g_edges):
-                    src = src_orig[g_edge_idx].item()
-                    tgt = tgt_orig[g_edge_idx].item()
-                    key = (src, tgt)
-
-                    if key in gs_edge_dict:
-                        # Direct edge exists
-                        gs_parent_new[g_edge_idx, 0] = gs_edge_dict[key]
-                    else:
-                        # Find double-hop path through intermediate nodes
-                        # Find neighbors of src in gs
-                        src_out_mask = gs[0] == src
-                        src_neighbors = gs[1, src_out_mask]
-                        src_edge_indices = torch.where(src_out_mask)[0]
-
-                        # Find in-neighbors of tgt in gs
-                        tgt_in_mask = gs[1] == tgt
-                        tgt_in_neighbors = gs[0, tgt_in_mask]
-
-                        # Find common intermediate nodes using torch.isin for faster lookup
-                        common_mask = torch.isin(src_neighbors, tgt_in_neighbors)
-
-                        if common_mask.any():
-                            # Get first common intermediate node
-                            first_common_idx = torch.where(common_mask)[0][0]
-                            intermediate = src_neighbors[first_common_idx].item()
-                            edge1_idx = src_edge_indices[first_common_idx]
-
-                            # Find edge from intermediate to tgt using hash lookup
-                            key2 = (intermediate, tgt)
-                            if key2 in gs_edge_dict:
-                                gs_parent_new[g_edge_idx, 0] = edge1_idx
-                                gs_parent_new[g_edge_idx, 1] = gs_edge_dict[key2]
+                g, gs_parent_new = self.pool_edge(edge_index2, m_idx, num_nodes, num_original_edge)
+                g, gs_parent_new = coalesce(g, gs_parent_new, num_nodes=len(m_idx), reduce='max')
 
                 m_gs.append(g)
                 m_ids.append(m_idx)
@@ -328,27 +289,24 @@ class SpringMassEvoMesh(EvoMesh):
 
             # Downsample edge_mech_in using gs_parent
             gs_parent = m_gs_parent[i]
-            parent_edge_1 = temporal_edge_mech_in[:, gs_parent[:, 0], :]  # T×M×2
-            mask = gs_parent[:, 1] != -1  # M
-            edge_mech_in_downsampled = parent_edge_1.clone()
-            if mask.any():
-                parent_edge_2 = temporal_edge_mech_in[:, gs_parent[mask, 1], :]  # T×M'×2
-                edge_mech_in_downsampled[:, mask, :] = (parent_edge_1[:, mask, :] + parent_edge_2) / 2.0
+            parent_edge_1 = edge_in[:, gs_parent[:, 0], :]  # T×M×2
+            mask = gs_parent[:, 0] != -1  # M
+            edge_in = parent_edge_1.clone()
+            # TODO(cxy) add later
+            # if mask.any():
+            #     edge_in[:, mask, :] = torch.mean(edge_in, dim=1)
 
-            temporal_edge_mech_in = edge_mech_in_downsampled
-
-        multi_level_edge_mech_info.append(temporal_edge_mech_in)
-        
+        multi_level_spring_force_info.append(edge_in)
         
         for l in range(self.bottom_ln):
-            node_in, ew, _ = self.bottom_gmp[l](node_in, temporal_edge_mech_in, m_gs[l_n], pos, vel)
+            node_in, ew, _ = self.bottom_gmp[l](node_in, edge_in, m_gs[l_n], pos, vel)
             if self.lagrangian and l == 0:
-                node_in, ew, _ = self.bottom_gmp[l](node_in, temporal_edge_mech_in, m_gs[l_n], pos, vel)
+                node_in, ew, _ = self.bottom_gmp[l](node_in, edge_in, m_gs[l_n], pos, vel)
 
         # up pass
         for i in range(l_n):
             up_idx = l_n - i - 1
-            g, idx, temporal_edge_mech_in = m_gs[up_idx], m_ids[up_idx], multi_level_edge_mech_info[up_idx]
+            g, idx, edge_in = m_gs[up_idx], m_ids[up_idx], multi_level_spring_force_info[up_idx]
             # if self.esn > 1:
             #     g_main, _ = add_remaining_self_loops(g[0])
             #     g_cont, _ = add_remaining_self_loops(g[1]) 
@@ -359,11 +317,12 @@ class SpringMassEvoMesh(EvoMesh):
             node_in = self.unpools[i](node_in, down_outs[up_idx].shape[-2], idx)
             tmp_g = g[0] if self.esn > 1 else g
             node_in= self.edge_conv(node_in, tmp_g, cts[up_idx], aggragating=False)
-            node_in, ew_u, edge_embedding = self.up_gmps[i](node_in, temporal_edge_mech_in, g, down_ps[up_idx], vel)
+            node_in, ew_u, edge_embedding = self.up_gmps[i](node_in, edge_in, g, down_ps[up_idx], vel)
      
             # if up_idx == 0 and self.lagrangian:
             #     node_in, ew_u = self.up_gmps[i](node_in, temporal_edge_mech_in, g, down_ps[up_idx], vel)
             node_in = node_in + down_outs[up_idx]
+        # print(num_nodes_list)
         return node_in, edge_embedding
     
 class TemporalFeatureAggregation(nn.Module):

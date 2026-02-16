@@ -48,6 +48,13 @@ def copy_vec3(data: wp.array(dtype=wp.vec3), origin: wp.array(dtype=wp.vec3)):
     origin[tid] = data[tid]
 
 
+# 支持梯度的 copy kernel，用于训练时保持梯度流
+@wp.kernel
+def copy_vec3_grad(data: wp.array(dtype=wp.vec3), origin: wp.array(dtype=wp.vec3)):
+    tid = wp.tid()
+    origin[tid] = data[tid]
+
+
 @wp.kernel(enable_backward=False)
 def copy_int(data: wp.array(dtype=wp.int32), origin: wp.array(dtype=wp.int32)):
     tid = wp.tid()
@@ -56,6 +63,13 @@ def copy_int(data: wp.array(dtype=wp.int32), origin: wp.array(dtype=wp.int32)):
 
 @wp.kernel(enable_backward=False)
 def copy_float(data: wp.array(dtype=wp.float32), origin: wp.array(dtype=wp.float32)):
+    tid = wp.tid()
+    origin[tid] = data[tid]
+
+
+# 支持梯度的 copy kernel for float，用于复制 spring_Y 和 rest_length
+@wp.kernel
+def copy_float_grad(data: wp.array(dtype=wp.float32), origin: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     origin[tid] = data[tid]
 
@@ -746,7 +760,6 @@ class SpringMassSystemWarp:
             init_rest_lengths, dtype=wp.float32,
             requires_grad=True,
         )
-
         self.wp_collide_elas = wp.from_torch(
             torch.tensor([collide_elas], dtype=torch.float32, device=self.device),
             requires_grad=cfg.collision_learn,
@@ -948,6 +961,37 @@ class SpringMassSystemWarp:
                 inputs=[wp_v],
                 outputs=[self.wp_states[0].wp_v],
             )
+
+    def update_spring_properties(self, predicted_spring_Y, predicted_rest_length):
+        """
+        使用模型预测的机械属性更新仿真器的弹簧参数
+        使用支持梯度的 copy kernel 来保持梯度流
+
+        Args:
+            predicted_spring_Y: PyTorch tensor，预测的弹簧杨氏模量（log scale）
+            predicted_rest_length: PyTorch tensor，预测的弹簧原长
+        """
+        # 转换为 Warp 数组，保持梯度
+        wp_predicted_spring_Y = wp.from_torch(
+            predicted_spring_Y.contiguous(), dtype=wp.float32, requires_grad=True
+        )
+        wp_predicted_rest_length = wp.from_torch(
+            predicted_rest_length.contiguous(), dtype=wp.float32, requires_grad=True
+        )
+
+        # 使用支持梯度的 kernel 复制数据到仿真器的数组中
+        wp.launch(
+            copy_float_grad,
+            dim=self.wp_spring_Y.shape[0],
+            inputs=[wp_predicted_spring_Y],
+            outputs=[self.wp_spring_Y],
+        )
+        wp.launch(
+            copy_float_grad,
+            dim=self.wp_rest_lengths.shape[0],
+            inputs=[wp_predicted_rest_length],
+            outputs=[self.wp_rest_lengths],
+        )
 
     def set_acc_count(self, acc_count):
         if acc_count:

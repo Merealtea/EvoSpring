@@ -1,0 +1,3 @@
+Case Name,Train Frame Num,Train Chamfer Error,Test Frame Num,Test Chamfer Error
+single_clift_cloth_3,66,0.0017941660110161386,30,0.004169980948790908
+double_lift_cloth_1,80,0.0043851629525306635,35,0.014359085075557231

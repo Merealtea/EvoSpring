@@ -17,7 +17,6 @@ import numpy as np
 # Import the trainer
 from src.spring_mass_trainer import SpringMassTrainer
 
-
 def set_all_seeds(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -26,7 +25,6 @@ def set_all_seeds(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def parse_args():
     parser = ArgumentParser(description='Visualize spring mass simulation')
@@ -47,11 +45,11 @@ def parse_args():
                         help='Object case name (e.g., cylinder, cloth, etc.)')
     parser.add_argument('--space_dim', type=int, default=3)
     parser.add_argument('--hidden_dim', type=int, default=128)
-    parser.add_argument('--multi_mesh_layer', type=int, default=3)
+    parser.add_argument('--multi_mesh_layer', type=int, default=7)
     parser.add_argument('--pre_layer_num', type=int, default=2)
     parser.add_argument('--bottom_layer_num', type=int, default=2)
     parser.add_argument('--hidden_depth', type=int, default=2)
-    parser.add_argument('--mp_time', type=int, default=3)
+    parser.add_argument('--mp_time', type=int, default=7)
     parser.add_argument('--enhance', action='store_true')
     parser.add_argument('--agg_conv_pos', action='store_true')
 
@@ -69,8 +67,8 @@ def parse_args():
     parser.add_argument('--noise_gamma', type=float, default=0.0)
     parser.add_argument('--recal_mesh', action='store_true')
     parser.add_argument('--consist_mesh', action='store_true')
-    parser.add_argument('--train_frame', type=int, default=100)
-    parser.add_argument('--test_frame', type=int, default=100)
+    parser.add_argument('--train_frame', type=int, default=10)
+    parser.add_argument('--test_frame', type=int, default=48)
 
     # Model loading
     parser.add_argument('--path', type=str, default='',

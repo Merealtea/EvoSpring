@@ -267,7 +267,6 @@ class EvoMesh(nn.Module):
         both_valid = (new_g[0] >= 0) & (new_g[1] >= 0)
         e_idx = torch.where(both_valid)[0]
         new_g = new_g[:, e_idx]
-
         return new_g
 
     def _pool_tensor(self, tensor, m_ids, y_hard, i, is_pre_layer):
