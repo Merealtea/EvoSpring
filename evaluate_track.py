@@ -5,8 +5,8 @@ import json
 import numpy as np
 from scipy.spatial import KDTree
 
-prediction_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/res/springmass/"
-base_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin/data/different_types/"
+prediction_path = "./res/springmass/"
+base_path = "./data/different_types/"
 output_file = "results/final_track.csv"
 
 
@@ -49,8 +49,8 @@ for dir_name in dir_names:
     train_frame = split["train"][1]
     test_frame = split["test"][1]
 
-    with open(f"{prediction_path}/{case_name}/best_trajectory.pkl", "rb") as f:
-        vertices = pickle.load(f)
+    with open(f"{prediction_path}/{case_name}/trajectories/best_trajectory.pkl", "rb") as f:
+        vertices = pickle.load(f)['vertices']
 
     with open(f"{base_path}/{case_name}/gt_track_3d.pkl", "rb") as f:
         gt_track_3d = pickle.load(f)

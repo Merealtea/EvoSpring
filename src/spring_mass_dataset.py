@@ -179,12 +179,13 @@ class MeshSpringMassDataset(MeshGeneralDataset):
                     edge_i = self.cells
 
                 m_gs, m_ids, m_edge_parents = generate_multi_layer_stride(edge_i,
-                                                          self.layer_num,
-                                                          seed_heuristic=self.seed_heuristic,
-                                                          n=self.mesh_pos.shape[0],
-                                                          pos_mesh=self.mesh_pos)
+                                                        self.layer_num,
+                                                        seed_heuristic=self.seed_heuristic,
+                                                        n=self.mesh_pos.shape[0],
+                                                        pos_mesh=self.mesh_pos)
                 m_mesh = {'m_gs': m_gs, 'm_ids': m_ids, 'm_edge_parents': m_edge_parents}
                 pickle.dump(m_mesh, open(mmfile, 'wb'))
+
             else:
                 m_mesh = pickle.load(open(mmfile, 'rb'))
                 m_gs, m_ids = m_mesh['m_gs'], m_mesh['m_ids']

@@ -319,10 +319,10 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
 
 if __name__ == "__main__":
     # 配置文件路径
-    object_cases = os.listdir('/mnt/pool1/cxy/phystwin-v2/PhysTwin/data/different_types')
-    opt_file_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/data/different_types'
-    param_file_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/experiments_optimization'
-    mech_gt_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/experiments'
+    object_cases = os.listdir('./data/different_types')
+    opt_file_path = './data/different_types'
+    param_file_path = './experiments_optimization'
+    mech_gt_path = './experiments'
 
     output_dir = './evomesh_optimization_outputs'
     os.makedirs(output_dir, exist_ok=True)

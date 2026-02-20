@@ -14,75 +14,6 @@ This model works for mechanical information estimations of spring-mass systems.
 """
 
 
-class WarpLossFunction(torch.autograd.Function):
-    """
-    桥接 Warp (可微物理模拟) 和 PyTorch (神经网络) 的梯度。
-    """
-
-    @staticmethod
-    def forward(ctx, wp_loss, tape, wp_spring_Y, wp_rest_lengths, torch_spring_Y, torch_rest_lengths):
-        # 1. 保存上下文供 backward 使用
-        # 注意：wp_loss 必须是 warp array，且在此之前已经计算完毕
-        ctx.tape = tape
-        ctx.wp_loss = wp_loss
-        ctx.wp_spring_Y = wp_spring_Y
-        ctx.wp_rest_lengths = wp_rest_lengths
-        
-        # 2. 将 Warp loss 转为 PyTorch tensor
-        # wp.to_torch 返回的 tensor 可能仍在 GPU 上，且需要 detach 以便作为新的叶子节点
-        loss_tensor = wp.to_torch(wp_loss).clone().detach()
-        
-        # 确保是标量，如果 shape 是 (1,) 需要 squeeze
-        if loss_tensor.numel() == 1:
-            loss_tensor = loss_tensor.squeeze()
-            
-        return loss_tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # grad_output 是 PyTorch 传来的 d(FinalLoss)/d(WarpLoss)
-        
-        # 1. 在 Warp 端进行反向传播
-        # 关键修正：必须对 wp_loss 求导，而不是对参数求导
-        ctx.tape.backward(loss=ctx.wp_loss)
-
-        # 2. 获取梯度并应用链式法则
-        grad_spring_Y = None
-        grad_rest_lengths = None
-
-        # 处理弹簧系数梯度
-        if ctx.wp_spring_Y.grad is not None:
-            # 将 Warp 梯度转回 PyTorch
-            # 注意：Warp 的梯度通常累加在 .grad 中，转为 torch 后需要 clone
-            grad_warp = wp.to_torch(ctx.wp_spring_Y.grad).clone()
-            
-            # 链式法则：dL/dx = (dL/d_warp_loss) * (d_warp_loss/dx)
-            # 即：grad_output * warp_grad
-            if grad_output.ndim == 0:
-                grad_spring_Y = grad_warp * grad_output
-            else:
-                # 处理 batch 或维度匹配情况
-                grad_spring_Y = grad_warp * grad_output.view(-1, 1) # 根据实际维度调整
-
-        # 处理静止长度梯度
-        if ctx.wp_rest_lengths.grad is not None:
-            grad_warp = wp.to_torch(ctx.wp_rest_lengths.grad).clone()
-            if grad_output.ndim == 0:
-                grad_rest_lengths = grad_warp * grad_output
-            else:
-                grad_rest_lengths = grad_warp * grad_output.view(-1, 1)
-
-        # 3. 梯度归零 (可选但推荐)
-        # Warp 的 tape 可能会累积梯度，为了安全起见，取完梯度后可以在这里 zero 
-        # 但这取决于你的 Simulator 是否会在每次 step 前 zero_grad。
-        # ctx.wp_spring_Y.grad.zero_() 
-
-        # 4. 返回梯度
-        # 返回值的顺序必须与 forward 的输入参数严格对应
-        # 输入: (ctx, wp_loss, tape, wp_spring_Y, wp_rest_lengths, torch_spring_Y, torch_rest_lengths)
-        # 只需要最后两个 PyTorch Tensor 的梯度
-        return None, None, None, None, grad_spring_Y, grad_rest_lengths
-
 class SpringMass(ModelGeneral):
     def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos):
         # in: d_x(used for driven nodes only),type
@@ -96,7 +27,10 @@ class SpringMass(ModelGeneral):
         self.encode = MLP(in_dim, ld, ld, mlp_hidden_layer, True)
         self.process = SpringMassEvoMesh(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim, self.lagrangian, enhance, agg_conv_pos, edge_set_num)
         self.temporal_feature_compression = TemporalFeatureAggregation(ld, ld, 2)
-        self.edge_decode = MLP(ld, ld, out_dim, mlp_hidden_layer, False)
+        self.edge_decode = torch.nn.Sequential(
+            MLP(ld, ld, out_dim, mlp_hidden_layer, False),
+        )
+
         self.MP_times = MP_times
         self.pos_dim = pos_dim
         self.mse = torch.nn.MSELoss(reduction='none')
@@ -412,10 +346,9 @@ class SpringMass(ModelGeneral):
         edge_feature = edge_feature[:num_edge//2] + edge_feature[num_edge//2]
         
         edge_mech_in_bias = self.edge_decode(edge_feature) 
+        # edge_mech_in_bias = torch.tanh(edge_mech_in_bias)
 
-        edge_in[..., -2] = torch.exp(edge_in[..., -2])
-
-        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 500
-        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.000001
+        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 10
+        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.000000
 
         return edge_mech_in_bias

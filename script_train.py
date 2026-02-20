@@ -21,9 +21,22 @@ with open(CONFIG_FILE, "r") as f:
             config[key] = value
 
 base_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/evomesh_optimization_outputs"
+res_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/res/springmass"
+
+if not os.path.exists(res_path):
+    os.makedirs(res_path)
+if not os.path.exists(base_path):
+    print(f"Base path {base_path} does not exist.")
+    exit(1)
+
 dir_names = os.listdir(base_path)
+finished_cases = os.listdir(res_path)
+
 for case_name in dir_names:
     print(f"Running case: {case_name}")
+    if case_name in finished_cases:
+        print(f"Case {case_name} already finished, skipping.")
+        continue
     os.system(
         f"python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
             -case {case} -space_dim {config['space_dim']} -local_rank {local_rank} \
@@ -31,7 +44,6 @@ for case_name in dir_names:
             -noise_level {config['noise_level']} \
             -multi_mesh_layer {config['multi_mesh_layer']} -consist_mesh {config['consist_mesh']} \
             -num_epochs {config['num_epochs']} -batch {config['batch']} -lr {config['lr']} -gamma {config['gamma']} \
-            -restart_epoch {RESTART_EPOCH} \
-            -mp_time {config['MP_time']} \
+            -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
             -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
     )

@@ -7,8 +7,8 @@ import numpy as np
 import os
 from pytorch3d.loss import chamfer_distance
 
-prediction_dir = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/res/springmass/"
-base_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin/data/different_types/"
+prediction_dir = "./res/springmass/"
+base_path = "./data/different_types/"
 output_file = "results/final_results.csv"
 
 if not os.path.exists("results"):
@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
         # Read the trajectory data
         with open(f"{dir_name}/trajectories/best_trajectory.pkl", "rb") as f:
-            vertices = pickle.load(f)
+            vertices = pickle.load(f)['vertices']
 
         # Read the GT object points and masks
         with open(f"{base_path}/{case_name}/final_data.pkl", "rb") as f:

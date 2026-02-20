@@ -1,6 +1,14 @@
 import numpy as np
 import scipy
-from sparse_dot_mkl import dot_product_mkl
+import scipy
+# 替换原来的 from sparse_dot_mkl import dot_product_mkl
+try:
+    from sparse_dot_mkl import dot_product_mkl
+except ImportError:
+    # 定义一个兼容函数，使用 Scipy 替代 MKL
+    def dot_product_mkl(A, B):
+        # Scipy 的 @ 运算符或 .dot() 在处理稀疏矩阵时非常高效
+        return A @ B
 from enum import Enum
 from helpers_convert import _flat_edge_to_adj_list, _flat_edge_to_adj_mat, _adj_mat_to_flat_edge
 from helpers_BFS import _find_clusters, _BFS_dist, _BFS_dist_all
@@ -153,9 +161,9 @@ def bstride_selection(flat_edge, seed_heuristic, pos_mesh=None, n=None):
     combined_idx_kept = list(combined_idx_kept)
     adj_mat = adj_mat.tocsr().astype(float)
 
+    adj_mat = adj_mat @ adj_mat
+    # adj_mat = dot_product_mkl(adj_mat, adj_mat) # BUG: cause indices overflow for large graph, need to check if the edge exists before dot product
 
-    # double hop
-    adj_mat = dot_product_mkl(adj_mat, adj_mat)
     adj_mat.setdiag(0)
 
     adj_mat = pool_edge(adj_mat, combined_idx_kept, n)
@@ -282,11 +290,13 @@ def generate_multi_layer_stride(flat_edge, num_l, seed_heuristic, n, pos_mesh=No
 
         # Get edge mapping information
         result = bstride_selection(g, seed_heuristic=seed_heuristic, pos_mesh=pos_mesh, n=n_l)
+
         index_to_keep, g_new = result
 
         # Find parent edges for each edge in the new layer
-        prev_adj_mat = _flat_edge_to_adj_mat(g, n=n_l)
+        prev_adj_mat = _flat_edge_to_adj_mat(g, n=n_l)        
         edge_parents = _find_edge_parents(g, g_new, prev_adj_mat, index_to_keep)
+
 
         pos_mesh = pos_mesh[index_to_keep]
         m_gs.append(g_new)

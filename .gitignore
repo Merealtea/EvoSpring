@@ -1,4 +1,8 @@
 __pycache__
-res
+/res
 *.mp4
 /evomesh_optimization_outputs
+/data
+/experiments
+/experiments_optimization
+/results

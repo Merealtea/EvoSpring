@@ -16,6 +16,7 @@ from time import time
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import pickle
+from copy import deepcopy
 
 # 3. 如果是 OffscreenRenderer，无头模式仍需保留
 # torch.autograd.set_detect_anomaly(True)
@@ -79,14 +80,13 @@ class SpringMassTrainer:
         # 初始化 Warp 优化器（仅在训练模式且 collision_learn 开启时）
         if cfg.collision_learn:
             # 确保 requires_grad=True
-            torch_spring_Y = wp.to_torch(self.model.module.simulator.wp_spring_Y)
-            torch_collide_elas = wp.to_torch(self.model.module.simulator.wp_collide_elas)
-            torch_collide_fric = wp.to_torch(self.model.module.simulator.wp_collide_fric)
-            torch_collide_object_elas = wp.to_torch(self.model.module.simulator.wp_collide_object_elas)
-            torch_collide_object_fric = wp.to_torch(self.model.module.simulator.wp_collide_object_fric)
+            self.torch_collide_elas = wp.to_torch(self.model.module.simulator.wp_collide_elas)
+            self.torch_collide_fric = wp.to_torch(self.model.module.simulator.wp_collide_fric)
+            self.torch_collide_object_elas = wp.to_torch(self.model.module.simulator.wp_collide_object_elas)
+            self.torch_collide_object_fric = wp.to_torch(self.model.module.simulator.wp_collide_object_fric)
             
-            warp_params_list = [torch_collide_elas, torch_collide_fric, 
-                                torch_collide_object_elas, torch_collide_object_fric]
+            warp_params_list = [self.torch_collide_elas, self.torch_collide_fric, 
+                                self.torch_collide_object_elas, self.torch_collide_object_fric]
         else:
             warp_params_list = []
 
@@ -514,7 +514,6 @@ class SpringMassTrainer:
         ax3.set_ylim(y_min - margin * y_range, y_max + margin * y_range)
         ax3.set_zlim(z_min - margin * z_range, z_max + margin * z_range)
 
-
         plt.tight_layout()
 
         # 保存图片
@@ -531,7 +530,7 @@ class SpringMassTrainer:
         return save_path
 
     def save_traj(
-        self,  mech_info=None, save_path=None
+        self,  mech_info=None, save_path=None, compute_loss=False
     ):
         # Get simulator reference
         simulator = self.model.module.simulator
@@ -554,11 +553,20 @@ class SpringMassTrainer:
         vertices = [
             wp.to_torch(simulator.wp_states[0].wp_x, requires_grad=False).cpu()
         ]
+        velocities = [
+            wp.to_torch(simulator.wp_states[0].wp_v, requires_grad=False).cpu()
+        ]
+
+        
+        # Initialize loss storage if compute_loss is True
+        frame_losses = [0]
+        chamfer_losses = [0]
+        track_losses = [0]
 
         with wp.ScopedTimer("simulate"):
             for i in tqdm(range(1, frame_len), desc="Saving trajectory"):
                 if cfg.data_type == "real":
-                    simulator.set_controller_target(i, pure_inference=True)
+                    simulator.set_controller_target(i, pure_inference=False)
                 if simulator.object_collision_flag:
                     simulator.update_collision_graph()
 
@@ -566,8 +574,28 @@ class SpringMassTrainer:
                     wp.capture_launch(simulator.forward_graph)
                 else:
                     simulator.step()
+
+                # Compute loss if requested
+                if compute_loss:
+                    if cfg.data_type == "real":
+                        simulator.calculate_loss()
+                        chamfer_loss = wp.to_torch(simulator.chamfer_loss, requires_grad=False).item()
+                        track_loss = wp.to_torch(simulator.track_loss, requires_grad=False).item()
+                        chamfer_losses.append(chamfer_loss)
+                        track_losses.append(track_loss)
+                    else:
+                        simulator.calculate_simple_loss()
+                        chamfer_losses.append(0.0)
+                        track_losses.append(0.0)
+
+                    frame_loss = wp.to_torch(simulator.loss, requires_grad=False).item()
+                    frame_losses.append(frame_loss)
+                    simulator.clear_loss()
+
                 x = wp.to_torch(simulator.wp_states[-1].wp_x, requires_grad=False)
+                v = wp.to_torch(simulator.wp_states[-1].wp_v, requires_grad=False)
                 vertices.append(x.cpu())
+                velocities.append(v.cpu())
                 # Set the intial state for the next step
                 simulator.set_init_state(
                     simulator.wp_states[-1].wp_x,
@@ -575,19 +603,31 @@ class SpringMassTrainer:
                 )
 
         vertices = torch.stack(vertices, dim=0)
+        velocities = torch.stack(velocities, dim=0)
 
         # 3. Save the trajectory to a file
         logger.info(f"Save the trajectory to {save_path}")
         vertices_to_save = vertices.cpu().numpy()
+        velocities_to_save = velocities.cpu().numpy()
+
+        # Prepare data to save
+        save_data = {
+            'vertices': vertices_to_save,
+            'velocities': velocities_to_save,
+        }
+
         with open(save_path, "wb") as f:
-            pickle.dump(vertices_to_save, f)
+            pickle.dump(save_data, f)
 
         logger.info(f"Trajectory saved successfully with shape {vertices_to_save.shape}")
-
+        if compute_loss:
+            return frame_losses, chamfer_losses, track_losses, save_data
 
     def run_epoch(self, epoch,
                   mode='train',
                   mech_info = None,
+                  prev_epoch_loss = None,
+                  save_data = None
                   ):
 
         if mode != 'train':
@@ -599,6 +639,10 @@ class SpringMassTrainer:
 
         # 单步仿真迭代训练
         simulator = self.model.module.simulator
+        # 初始化仿真器状态
+        simulator.set_init_state(simulator.wp_init_vertices, 
+                                    simulator.wp_init_velocities)
+
 
         # 启动GPU内存记录（仅训练模式）
         # if mode == 'train':
@@ -616,20 +660,27 @@ class SpringMassTrainer:
             m_ids, m_gs, m_gs_parent = \
                 self._preproc_multi_infos(self.mdata)
 
-            for frame_idx in range(1, self.mdata.train_frame, 5):
+            steps = 1
+
+            for frame_idx in range(1, self.mdata.train_frame, steps):
                 frame_error = 1
                 retry_times = 0
-                while ((frame_error > 0.00005) and (retry_times < max_iter)):
-                    # 初始化仿真器状态
-                    simulator.set_init_state(simulator.wp_init_vertices, 
-                                             simulator.wp_init_velocities)
-                    frame_error = 0
+                frame_init_vertices = wp.to_torch(simulator.wp_states[0].wp_x).detach().clone()
+                frame_init_velocities = wp.to_torch(simulator.wp_states[0].wp_v).detach().clone()
 
-                    self.optimizer.zero_grad()
-                    for sub_frame_idx in range(1, frame_idx+1):
+                while ((frame_error > np.mean(prev_epoch_loss[frame_idx : frame_idx + steps])) and (retry_times < max_iter)):
+                    frame_error = 0
+   
+                    simulator.set_init_state(
+                        wp.from_torch(frame_init_vertices, dtype=wp.vec3, requires_grad=False),
+                        wp.from_torch(frame_init_velocities, dtype=wp.vec3, requires_grad=False)
+                    )
+                    
+                    for sub_frame_idx in range(frame_idx, min(frame_idx + steps, self.mdata.train_frame)):
                         
-                        print(f"\n--- Processing Frame {sub_frame_idx}/{self.mdata.train_frame-1} ---")
+                        # print(f"\n--- Processing Frame {sub_frame_idx}/{self.mdata.train_frame-1} ---")
                         
+                        self.optimizer.zero_grad()
                         # 获取当前帧数据（前一帧和当前帧）
                         pos, vel, node_mass, spring_Y, spring_rest_length, \
                             drag_damping, spring_force, dashpot_force, overall_forces = \
@@ -643,7 +694,7 @@ class SpringMassTrainer:
                         )
 
                         # 3. 模型预测机械属性
-                        st = time()
+                        # st = time()
 
                         # spring_Y 和 rest_length 的预测值是基于 edge_in_feature 的，因此我们需要将 edge_in_feature 传入模型进行预测
                         edge_mech_in_bias = self.model(m_ids, m_gs, m_gs_parent, 
@@ -654,10 +705,10 @@ class SpringMassTrainer:
                         new_spring_Y = torch.exp(spring_Y[:num_edge // 2, 0]) + edge_mech_in_bias[:, 0]
                         new_rest_length = spring_rest_length[:num_edge // 2, 0] + edge_mech_in_bias[:, 1]
 
-                        new_spring_Y = torch.log(torch.clip(new_spring_Y, 1e2, cfg.spring_Y_max))
-                        new_rest_length = torch.clip(new_rest_length, 2e-5, self.mdata.max_radius)
+                        new_spring_Y = torch.log(torch.clip(new_spring_Y, 1e-2, cfg.spring_Y_max))
+                        new_rest_length = torch.clip(new_rest_length, 2e-10, self.mdata.max_radius)
 
-                        print(f"Model inference time: {time() - st:.4f} seconds")
+                        # print(f"Model inference time: {time() - st:.4f} seconds")
 
                         # 4. 使用预测的机械属性进行单步仿真并计算loss和反传
                         tape, frame_loss, chamfer_loss, track_loss = \
@@ -667,31 +718,31 @@ class SpringMassTrainer:
                                 enable_backward=True
                             )
 
-                        # 4.5 可视化点云（每10帧或第一帧）
-                        if sub_frame_idx % 10 == 0 or sub_frame_idx == 1:
-                            # 获取前一帧点云（只取object points）
-                            prev_points = pos[0][:simulator.num_object_points]
+                        # # 4.5 可视化点云（每10帧或第一帧）
+                        # if sub_frame_idx % 10 == 0 or sub_frame_idx == 1:
+                        #     # 获取前一帧点云（只取object points）
+                        #     prev_points = pos[0][:simulator.num_object_points]
 
-                            # 获取step后的点云
-                            step_points = torch.cat([
-                                wp.to_torch(simulator.wp_states[-1].wp_x).clone(),
-                            ])[:simulator.num_object_points]
+                        #     # 获取step后的点云
+                        #     step_points = torch.cat([
+                        #         wp.to_torch(simulator.wp_states[-1].wp_x).clone(),
+                        #     ])[:simulator.num_object_points]
 
-                            # 获取真值点云
-                            gt_points = self.mdata.object_point[sub_frame_idx]
-                            if gt_points is not None and len(gt_points) > 0:
-                                gt_points = torch.FloatTensor(gt_points).to(prev_points.device)
+                        #     # 获取真值点云
+                        #     gt_points = self.mdata.object_point[sub_frame_idx]
+                        #     if gt_points is not None and len(gt_points) > 0:
+                        #         gt_points = torch.FloatTensor(gt_points).to(prev_points.device)
 
-                                # 调用可视化函数
-                                try:
-                                    self.visualize_point_clouds(
-                                        prev_points=prev_points,
-                                        step_points=step_points,
-                                        gt_points=gt_points,
-                                        frame_idx=sub_frame_idx
-                                    )
-                                except:
-                                    import pdb; pdb.set_trace()
+                        #         # 调用可视化函数
+                        #         try:
+                        #             self.visualize_point_clouds(
+                        #                 prev_points=prev_points,
+                        #                 step_points=step_points,
+                        #                 gt_points=gt_points,
+                        #                 frame_idx=sub_frame_idx
+                        #             )
+                        #         except:
+                        #             import pdb; pdb.set_trace()
 
                         # 5. 提取梯度
                         wp_predicted_spring_Y = simulator.wp_spring_Y
@@ -705,32 +756,39 @@ class SpringMassTrainer:
                         # -------------------------------------------------------
                         
                         torch.autograd.backward(
-                            tensors=[new_spring_Y, new_rest_length],
-                            grad_tensors=[grad_spring_Y, grad_rest_length],
+                            tensors=[new_spring_Y, new_rest_length, 
+                                     self.torch_collide_elas, self.torch_collide_fric,
+                                     self.torch_collide_object_elas, self.torch_collide_object_fric],
+                            grad_tensors=[grad_spring_Y, grad_rest_length,
+                                          wp.to_torch(simulator.wp_collide_elas.grad),
+                                          wp.to_torch(simulator.wp_collide_fric.grad),
+                                          wp.to_torch(simulator.wp_collide_object_elas.grad),
+                                          wp.to_torch(simulator.wp_collide_object_fric.grad)],
                         )
 
-                        # 获取总Loss的数值用于统计
+                        # # 获取总Loss的数值用于统计
                         loss_val = wp.to_torch(frame_loss).item()
 
-                        print(f"Spring_Y Grad Norm: {grad_spring_Y.norm().item():.6f}")
-                        print(f"Rest_Length Grad Norm: {grad_rest_length.norm().item():.6f}")
+                        # print(f"Spring_Y Grad Norm: {grad_spring_Y.norm().item():.6f}")
+                        # print(f"Rest_Length Grad Norm: {grad_rest_length.norm().item():.6f}")
 
-                        # 打印碰撞参数梯度（如果启用了collision_learn）
+                        # # 打印碰撞参数梯度（如果启用了collision_learn）
                         if cfg.collision_learn:
                             print(f"Collision Elas Grad: {wp.to_torch(simulator.wp_collide_elas.grad)}")
                             print(f"Collision Fric Grad: {wp.to_torch(simulator.wp_collide_fric.grad)}")
                             print(f"Collision Object Elas Grad: {wp.to_torch(simulator.wp_collide_object_elas.grad)}")
                             print(f"Collision Object Fric Grad: {wp.to_torch(simulator.wp_collide_object_fric.grad)}")
 
+
                         # 打印仿真参数
                         print(f"\n{'='*60}")
                         print(f"Spring_Y Average: {new_spring_Y.mean().item():.6f}")
                         print(f"Rest_Length Average: {new_rest_length.mean().item():.6f}")
                         print(f"\nCollision Parameters:")
-                        print(f"  collide_elas: {wp.to_torch(self.model.module.simulator.wp_collide_elas).item():.6f}")
-                        print(f"  collide_fric: {wp.to_torch(self.model.module.simulator.wp_collide_fric).item():.6f}")
-                        print(f"  collide_object_elas: {wp.to_torch(self.model.module.simulator.wp_collide_object_elas).item():.6f}")
-                        print(f"  collide_object_fric: {wp.to_torch(self.model.module.simulator.wp_collide_object_fric).item():.6f}")
+                        print(f"  collide_elas: {wp.to_torch(self.model.module.simulator.wp_collide_elas).item():.10f}")
+                        print(f"  collide_fric: {wp.to_torch(self.model.module.simulator.wp_collide_fric).item():.10f}")
+                        print(f"  collide_object_elas: {wp.to_torch(self.model.module.simulator.wp_collide_object_elas).item():.10f}")
+                        print(f"  collide_object_fric: {wp.to_torch(self.model.module.simulator.wp_collide_object_fric).item():.10f}")
 
                         print(f"\nLoss Breakdown:")
                         print(f"{'='*60}\n")
@@ -738,16 +796,24 @@ class SpringMassTrainer:
                         print(f"Chamfer Loss: {chamfer_loss.item():.6f}")
                         print(f"Track Loss: {track_loss.item():.6f}")
 
+                        # PyTorch 优化器更新神经网络参数
+                        self.optimizer.step()
+
+                        if cfg.collision_learn:
+                            # 将更新后的碰撞参数同步回simulator的wp参数
+                            with torch.no_grad():
+                                simulator.set_collide(wp.from_torch(self.torch_collide_elas, dtype=wp.float32),
+                                                     wp.from_torch(self.torch_collide_fric, dtype=wp.float32))
+                                simulator.set_collide_object(wp.from_torch(self.torch_collide_object_elas, dtype=wp.float32),
+                                                            wp.from_torch(self.torch_collide_object_fric, dtype=wp.float32))                   
+                        
                         if cfg.use_graph:
                             # Only need to clear the gradient, the tape is created in the graph
                             tape.zero()
                         else:
                             # Need to reset the compute graph and clear the gradient
                             tape.reset()
-
-                        # PyTorch 优化器更新神经网络参数
-                        self.optimizer.step()
-                            
+                        
                         simulator.clear_loss()
                         # 更新状态为下一帧的初始状态
                         simulator.set_init_state(simulator.wp_states[-1].wp_x, 
@@ -755,7 +821,7 @@ class SpringMassTrainer:
                      
                         # stats
                         frame_error += loss_val
-                    frame_error /= frame_idx
+                    frame_error /= steps
                     retry_times += 1
 
                     # 保存内存快照（每次重试后）
@@ -767,8 +833,9 @@ class SpringMassTrainer:
                     # except Exception as e:
                     #     logger.warning(f"Failed to save memory snapshot: {e}")
 
-                # import pdb; pdb.set_trace()
-                mean_loss_insts = frame_error
+                    # import pdb; pdb.set_trace()
+                    print(f'Retries {retry_times}, frame error is {frame_error:.8f}, target error is {np.mean(prev_epoch_loss[frame_idx : frame_idx + steps]):.8f}')
+                mean_loss_insts += frame_error * steps
         else:
             assert mech_info is not None, "In test mode, mech_info must be provided."
 
@@ -841,11 +908,11 @@ class SpringMassTrainer:
 
         # 返回最后一帧的mech_info
         final_mech_info = torch.stack([new_spring_Y, new_rest_length], dim=1).detach() if mode == 'train' else None
+        mean_loss_insts /= (self.mdata.train_frame - 1)
         return mean_loss_insts, final_mech_info
 
     def train(self):
         # load phystwin zero-grad optimization results and warp simulator here
-        best_loss = 1e8
         best_mech_info = None
         best_epoch = None
 
@@ -855,8 +922,23 @@ class SpringMassTrainer:
         patience = 5  # Number of epochs to wait before stopping
         patience_counter = 0
 
+        # Early stopping parameters for loss non-improvement  # Number of epochs to wait for loss improvement
+        loss_patience_counter = 0
+        min_delta = 1e-6  # Minimum change in loss to qualify as improvement
+
+        # Save initial trajectory before training
+        initial_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'initial_trajectory.pkl')
+        logger.info("Saving initial trajectory before training with loss computation")
+        frame_losses, chamfer_losses, track_losses, save_data\
+            = self.save_traj(mech_info=None, save_path=initial_traj_save_path, compute_loss=True)
+        
+        best_loss = np.mean(frame_losses[:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
+
         for epoch in self.pbar:
-            mean_loss_train, mech_info = self.run_epoch(epoch, 'train')
+            mean_loss_train, mech_info = self.run_epoch(epoch, 
+                                                        'train',
+                                                        prev_epoch_loss = frame_losses,
+                                                        save_data=save_data)
             with torch.autograd.no_grad():
                 # train loss record
                 if dist.get_rank() == 0:
@@ -864,6 +946,10 @@ class SpringMassTrainer:
                     self.writer.add_scalar('RMSE/train', math.sqrt(mean_loss_train), epoch)
                     self.writer.add_scalar('lr/train', self.optimizer.param_groups[0]['lr'], epoch)
                     
+                    # record mean value of mech_info for monitoring
+                    self.writer.add_scalar('mech_info/spring_Y', mech_info[:, 0].mean().item(), epoch)
+                    self.writer.add_scalar('mech_info/rest_length', mech_info[:, 1].mean().item(), epoch)
+
                     # dump ckpt
                     ckpt_path = os.path.join(self.args.dump_dir, 'ckpts', str(epoch) + "_" + self.checkpt_name)
                     torch.save(self.model.module.state_dict(), ckpt_path)
@@ -876,16 +962,35 @@ class SpringMassTrainer:
                     traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', f'epoch_{epoch}_trajectory.pkl')
                     logger.info(f"Saving trajectory for epoch {epoch}")
                     self.save_traj(mech_info=mech_info.clone(), save_path=traj_save_path)
-
-                    if best_loss > mean_loss_train:
+   
+                    # Check for loss improvement
+                    if best_loss > mean_loss_train :
+                        logger.info(f"New best loss {mean_loss_train:.10f} at epoch {epoch}, prev best loss is {best_loss:.10f}, saving best trajectory")
+                        # Loss improved significantly
                         best_mech_info = mech_info.clone()
                         best_epoch = epoch
                         best_loss = mean_loss_train
+                        loss_patience_counter = 0  # Reset loss patience counter
 
                         # Save best trajectory
                         best_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'best_trajectory.pkl')
-                        logger.info(f"New best loss {best_loss:.6f} at epoch {epoch}, saving best trajectory")
-                        self.save_traj(mech_info=mech_info.clone(), save_path=best_traj_save_path)
+                        
+                        frame_losses, chamfer_losses, track_losses, save_data\
+                             = self.save_traj(mech_info=mech_info.clone(), save_path=best_traj_save_path, compute_loss=True)
+                    else:
+                        # Loss did not improve
+                        loss_patience_counter += 1
+                        logger.info(f"Current loss: {mean_loss_train:.10f}, Best loss: {best_loss:.10f}")
+                        logger.info(f"Loss did not improve. Loss patience counter: {loss_patience_counter}/{patience}")
+                        self.writer.add_scalar('early_stopping/loss_patience_counter', loss_patience_counter, epoch)
+
+                        if loss_patience_counter >= patience:
+                            logger.info(f"Early stopping triggered at epoch {epoch}. Loss has not improved for {patience} epochs.")
+                            self.pbar.close()
+                            # Save final best mech_info before stopping
+                            mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', "best_{}.pth".format(best_epoch))
+                            torch.save(best_mech_info, mech_info_path)
+                            return
 
                     # Check mech_info convergence for early stopping
                     if prev_mech_info is not None:
