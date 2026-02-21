@@ -47,3 +47,4 @@ for case_name in dir_names:
             -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
             -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
     )
+

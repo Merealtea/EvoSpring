@@ -19,7 +19,7 @@ import pickle
 from copy import deepcopy
 
 # 3. 如果是 OffscreenRenderer，无头模式仍需保留
-# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
 os.environ["GALLIUM_DRIVER"] = "llvmpipe"
 
@@ -36,6 +36,7 @@ class SpringMassTrainer:
         mdata = self._create_dataset_offline(mode='train')
 
         self.mdata = mdata
+        self.total_update = 0
 
         if "cloth" in mdata.object_case or "package" in mdata.object_case:
                 cfg.load_from_yaml("configs/phystwin_configs/cloth.yaml")
@@ -341,7 +342,7 @@ class SpringMassTrainer:
         # Total force on each edge
         overall_forces = spring_force + dashpot_force # [num_edges, 3]
 
-        return pos, vel, node_mass, torch.log(spring_Y[0]), spring_rest_length[0], drag_damping, spring_force, dashpot_force, overall_forces
+        return pos.detach(), vel.detach(), node_mass.detach(), torch.log(spring_Y[0]).detach(), spring_rest_length[0].detach(), drag_damping, spring_force.detach(), dashpot_force.detach(), overall_forces.detach()
 
     def simulate_single_step_with_prediction(self, frame_idx, prev_point_pos, prev_point_vel, 
                                              predicted_log_spring_Y, predicted_rest_length, enable_backward=False):
@@ -430,7 +431,8 @@ class SpringMassTrainer:
 
             simulator.step()
 
-            simulator.set_init_state(simulator.wp_states[-1].wp_x, simulator.wp_states[-1].wp_v, pure_inference=True)
+            simulator.set_init_state(simulator.wp_states[-1].wp_x, 
+                                     simulator.wp_states[-1].wp_v, pure_inference=True)
             if cfg.data_type == "real" and frame_idx > 1:
                 simulator.update_acc()
                 simulator.set_acc_count(True)
@@ -643,6 +645,8 @@ class SpringMassTrainer:
         simulator.set_init_state(simulator.wp_init_vertices, 
                                     simulator.wp_init_velocities)
 
+        simulator.update_spring_properties(mech_info[:,0],
+                                            mech_info[:,1]) 
 
         # 启动GPU内存记录（仅训练模式）
         # if mode == 'train':
@@ -668,7 +672,12 @@ class SpringMassTrainer:
                 frame_init_vertices = wp.to_torch(simulator.wp_states[0].wp_x).detach().clone()
                 frame_init_velocities = wp.to_torch(simulator.wp_states[0].wp_v).detach().clone()
 
+                pos, vel, node_mass, spring_Y, spring_rest_length, \
+                    drag_damping, spring_force, dashpot_force, overall_forces = \
+                    self.get_single_frame_data(frame_idx, m_gs, use_gt=True)
+
                 while ((frame_error > np.mean(prev_epoch_loss[frame_idx : frame_idx + steps])) and (retry_times < max_iter)):
+                    # DEBUG : single frame overfit test
                     frame_error = 0
    
                     simulator.set_init_state(
@@ -682,13 +691,10 @@ class SpringMassTrainer:
                         
                         self.optimizer.zero_grad()
                         # 获取当前帧数据（前一帧和当前帧）
-                        pos, vel, node_mass, spring_Y, spring_rest_length, \
-                            drag_damping, spring_force, dashpot_force, overall_forces = \
-                            self.get_single_frame_data(sub_frame_idx, m_gs, use_gt=True)
-
+                        
                         node_in_feature, edge_in_feature = self.mdata._preprocess(
                             pos, vel, node_mass,
-                            spring_Y, spring_rest_length,
+                            spring_Y.detach(), spring_rest_length.detach(),
                             drag_damping, spring_force, dashpot_force, 
                             overall_forces, device=self.device
                         )
@@ -700,16 +706,23 @@ class SpringMassTrainer:
                         edge_mech_in_bias = self.model(m_ids, m_gs, m_gs_parent, 
                                                node_in_feature, 
                                                edge_in_feature)
+
+                        print(f"edge_mech_in_bias mean: {edge_mech_in_bias[:,0].mean().item():.6f}, std: {edge_mech_in_bias.std().item():.6f}")
+                        print(f"edge_mech_in_bias min: {edge_mech_in_bias[:,0].min().item():.6f}, max: {edge_mech_in_bias[:,0].max().item():.6f}")
+                        print(f"edge_mech_in_bias max: {edge_mech_in_bias[:,0].max().item():.6f}")
+
                         num_edge = edge_in_feature.shape[1]
 
-                        new_spring_Y = torch.exp(spring_Y[:num_edge // 2, 0]) + edge_mech_in_bias[:, 0]
-                        new_rest_length = spring_rest_length[:num_edge // 2, 0] + edge_mech_in_bias[:, 1]
+                        new_spring_Y = torch.exp(spring_Y[:num_edge // 2, 0]).detach() + edge_mech_in_bias[:, 0]
+                        new_rest_length = spring_rest_length[:num_edge // 2, 0].detach() + edge_mech_in_bias[:, 1]
 
                         new_spring_Y = torch.log(torch.clip(new_spring_Y, 1e-2, cfg.spring_Y_max))
                         new_rest_length = torch.clip(new_rest_length, 2e-10, self.mdata.max_radius)
 
-                        # print(f"Model inference time: {time() - st:.4f} seconds")
-
+                        # for name, param in self.model.named_parameters():
+                        #     if param.requires_grad and param.grad is not None:
+                        #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item():.6f}")
+         
                         # 4. 使用预测的机械属性进行单步仿真并计算loss和反传
                         tape, frame_loss, chamfer_loss, track_loss = \
                             self.simulate_single_step_with_prediction(
@@ -756,15 +769,27 @@ class SpringMassTrainer:
                         # -------------------------------------------------------
                         
                         torch.autograd.backward(
-                            tensors=[new_spring_Y, new_rest_length, 
-                                     self.torch_collide_elas, self.torch_collide_fric,
-                                     self.torch_collide_object_elas, self.torch_collide_object_fric],
-                            grad_tensors=[grad_spring_Y, grad_rest_length,
-                                          wp.to_torch(simulator.wp_collide_elas.grad),
-                                          wp.to_torch(simulator.wp_collide_fric.grad),
-                                          wp.to_torch(simulator.wp_collide_object_elas.grad),
-                                          wp.to_torch(simulator.wp_collide_object_fric.grad)],
+                            tensors=[new_spring_Y, new_rest_length],
+                            grad_tensors=[grad_spring_Y, grad_rest_length],
                         )
+
+                        # 打印模型的每一层参数和梯度信息（如果需要）
+                        # for name, param in self.model.module.named_parameters():
+                        #     if param.requires_grad and param.grad is not None:
+                        #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item()}")
+                        #     elif param.requires_grad:
+                        #         print(f"Parameter: {name} has no gradient.")
+
+                        # torch.autograd.backward(
+                        #     tensors=[new_spring_Y, new_rest_length, 
+                        #              self.torch_collide_elas, self.torch_collide_fric,
+                        #              self.torch_collide_object_elas, self.torch_collide_object_fric],
+                        #     grad_tensors=[grad_spring_Y, grad_rest_length,
+                        #                   wp.to_torch(simulator.wp_collide_elas.grad),
+                        #                   wp.to_torch(simulator.wp_collide_fric.grad),
+                        #                   wp.to_torch(simulator.wp_collide_object_elas.grad),
+                        #                   wp.to_torch(simulator.wp_collide_object_fric.grad)],
+                        # )
 
                         # # 获取总Loss的数值用于统计
                         loss_val = wp.to_torch(frame_loss).item()
@@ -778,7 +803,11 @@ class SpringMassTrainer:
                             print(f"Collision Fric Grad: {wp.to_torch(simulator.wp_collide_fric.grad)}")
                             print(f"Collision Object Elas Grad: {wp.to_torch(simulator.wp_collide_object_elas.grad)}")
                             print(f"Collision Object Fric Grad: {wp.to_torch(simulator.wp_collide_object_fric.grad)}")
-
+                        
+                        self.total_update += 1
+                        self.writer.add_scalar('Single Frame/Frame_Loss', loss_val, self.total_update)
+                        self.writer.add_scalar('Single Frame/Spring_Y_Average', new_spring_Y.mean().item(), self.total_update)
+                        self.writer.add_scalar('Single Frame/Rest_Length_Average', new_rest_length.mean().item(), self.total_update)
 
                         # 打印仿真参数
                         print(f"\n{'='*60}")
@@ -934,9 +963,15 @@ class SpringMassTrainer:
         
         best_loss = np.mean(frame_losses[:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
 
+        # get initial mech_info from zero-grad optimization results
+        spring_rest_length = torch.FloatTensor(self.mdata.spring_reset_length).to(self.device)
+        init_spring_Y = torch.log(torch.ones_like(spring_rest_length) * self.mdata.init_spring_Y)
+        default_mech = torch.stack([init_spring_Y, spring_rest_length], dim=1)
+
         for epoch in self.pbar:
             mean_loss_train, mech_info = self.run_epoch(epoch, 
                                                         'train',
+                                                        mech_info=default_mech,
                                                         prev_epoch_loss = frame_losses,
                                                         save_data=save_data)
             with torch.autograd.no_grad():

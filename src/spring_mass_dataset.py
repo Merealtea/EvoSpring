@@ -50,7 +50,8 @@ class MeshSpringMassDataset(MeshGeneralDataset):
 
             self.object_point = np.array(f['object_points'])
             self.mesh_pos = np.array(f['mesh_pos'])[0]
-            self.init_spring_Y = np.array(f['init_spring_Y'])
+       
+            self.init_spring_Y = float(np.array(f['init_spring_Y']))
             self.spring_reset_length = np.array(f['spring_reset_length'])[0,:,0]
             self.spring_dashpot_damping = np.array(f['spring_dashpot_damping'])[0,:,0]
             self.masses = np.array(f['mass'])[0,:,0]

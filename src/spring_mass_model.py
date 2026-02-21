@@ -27,16 +27,21 @@ class SpringMass(ModelGeneral):
         self.encode = MLP(in_dim, ld, ld, mlp_hidden_layer, True)
         self.process = SpringMassEvoMesh(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim, self.lagrangian, enhance, agg_conv_pos, edge_set_num)
         self.temporal_feature_compression = TemporalFeatureAggregation(ld, ld, 2)
-        self.edge_decode = torch.nn.Sequential(
-            MLP(ld, ld, out_dim, mlp_hidden_layer, False),
-        )
-
+        self.edge_decode = MLP(ld, ld, out_dim, mlp_hidden_layer, False)
+        
+        self.Kaiming_init()
         self.MP_times = MP_times
         self.pos_dim = pos_dim
-        self.mse = torch.nn.MSELoss(reduction='none')
         
         self.gamma = 0.999
         self.register_buffer('temp', torch.tensor(5.))
+
+    def Kaiming_init(self):
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
 
     def load_warp_simulator(
             self,
@@ -302,9 +307,11 @@ class SpringMass(ModelGeneral):
         return node_info[..., self.pos_dim: self.pos_dim].clone()
 
     def _EMD(self, node_feature, edge_feature, m_ids, multi_gs, m_gs_parent, pos, vel):
-        if self.temp > 0.1 :
-            self.temp *= self.gamma
-            self.temp = torch.clamp(self.temp, 0.1)
+        # if self.temp > 0.1 :
+        #     self.temp *= self.gamma
+        #     self.temp = torch.clamp(self.temp, 0.1)
+
+        self.temp = torch.tensor(0.1).to(node_feature.device)
 
         # pos = self._get_pos(node_feature)[0]
         node_feature = self._get_nodal_latent_input(node_feature)
@@ -346,9 +353,10 @@ class SpringMass(ModelGeneral):
         edge_feature = edge_feature[:num_edge//2] + edge_feature[num_edge//2]
         
         edge_mech_in_bias = self.edge_decode(edge_feature) 
+        # edge_mech_in_bias = torch.tanh(bias)
         # edge_mech_in_bias = torch.tanh(edge_mech_in_bias)
 
-        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 10
-        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.000000
+        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 100
+        edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.00000
 
         return edge_mech_in_bias
