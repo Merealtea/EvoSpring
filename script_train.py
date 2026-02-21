@@ -20,8 +20,8 @@ with open(CONFIG_FILE, "r") as f:
             value = value.strip().strip("'\"")
             config[key] = value
 
-base_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/evomesh_optimization_outputs"
-res_path = "/mnt/pool1/cxy/phystwin-v2/PhysTwin-V2/res/springmass"
+base_path = "./evomesh_optimization_outputs"
+res_path = "./res/springmass"
 
 if not os.path.exists(res_path):
     os.makedirs(res_path)
