@@ -8,6 +8,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import models as models
 import spring_mass_model 
+import neural_spring
 import math
 import random
 import numpy as np
@@ -17,17 +18,30 @@ import warp as wp
 import os
 from time import time
 
+import logging
+
+# 禁用所有 warp 相关的 logger
+logging.getLogger("warp").setLevel(logging.ERROR)
+
 @wp.kernel
 def accum_loss_kernel(loss_accum: wp.array(dtype=float), frame_loss: wp.array(dtype=float)):
     # 简单的累加操作: loss_accum[0] += frame_loss[0]
     wp.atomic_add(loss_accum, 0, frame_loss[0])
 
-class SpringMassTrainer:
+class NSFTrainer:
     def __init__(self, args, device):
         self.args = args
         self.device = device
-        self._create_model()
+        
         mdata = self._create_dataset_offline(mode='train')
+
+        num_springs = len(mdata.spring_reset_length)
+        init_spring_Y = torch.ones(num_springs).to(self.device) * mdata.init_spring_Y
+        spring_rest_length = torch.tensor(mdata.spring_reset_length).to(self.device)
+
+        self.spring_rest_length = spring_rest_length
+
+        self._create_model(num_springs, init_spring_Y)
 
         self.mdata = mdata
         self.total_update = 0
@@ -85,10 +99,13 @@ class SpringMassTrainer:
         else:
             warp_params_list = []
 
-        self.optimizer = torch.optim.Adam([p for p in self.model.module.parameters()] + warp_params_list, 
+        self.optimizer = torch.optim.Adam([p for p in self.model.module.parameters()],
                                           lr=self.args.lr, 
                                           betas=(0.9, 0.99))
 
+        self.collide_optimizer = torch.optim.Adam(warp_params_list, 
+                                          lr=self.args.lr, 
+                                          betas=(0.9, 0.99))
 
         def linear_warmup_lr(epoch):
             max_lr = self.args.lr  
@@ -97,6 +114,7 @@ class SpringMassTrainer:
                 return min_lr + (max_lr - min_lr) * (epoch / self.args.warmup_epochs) 
             else:
                 return 1.0  
+            
         self.warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=linear_warmup_lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.args.gamma)
         if dist.get_rank() == 0:
@@ -108,23 +126,12 @@ class SpringMassTrainer:
             dir = os.path.join(self.args.dump_dir, subdir)
             os.makedirs(dir, exist_ok=True)
 
-    def _create_model(self):
-        if self.args.case == 'spring_mass':
-            self.model_class = spring_mass_model.SpringMass
-            self.dataset_class = spring_mass_dataset.MeshSpringMassDataset
-            self.object_case = self.args.object_case
-        else:
-            raise NotImplementedError("A Case not wrapped yet")
-        self.model = self.model_class(
-            pos_dim=self.args.space_dim, 
-            ld=self.args.hidden_dim, 
-            layer_num=self.args.multi_mesh_layer, 
-            pre_layer_num=self.args.pre_layer_num, 
-            bottom_layer_num=self.args.bottom_layer_num,
-            mlp_hidden_layer=self.args.hidden_depth, 
-            MP_times=self.args.mp_time,
-            enhance=self.args.enhance, 
-            agg_conv_pos=self.args.agg_conv_pos
+    def _create_model(self, num_springs=None, init_spring_Y=None):
+        self.object_case = self.args.object_case
+
+        self.model = neural_spring.NeuralSpringField(
+            num_springs=num_springs,
+            s0_init=init_spring_Y
         )
 
         if self.args.restart_epoch < 0 and not self.args.scratch:
@@ -196,11 +203,45 @@ class SpringMassTrainer:
 
         return m_ids, m_gs, m_gs_parents, node_in_feature, edge_mech_in_feature, node_tar
 
+    def get_spring_midpoints(self):
+        """
+        Calculate the midpoint coordinates of springs in 3D space.
+
+        Args:
+            frame_idx: Frame index to use for positions (default: 0 for first frame)
+
+        Returns:
+            midpoints: Spring midpoint coordinates, shape (num_springs, 3)
+        """
+        # Extract cells and positions from self.mdata
+        cells = self.mdata.cells
+        positions = self.mdata.mesh_pos 
+
+        # Get the two endpoints for each spring
+        point1_indices = cells[0]
+        point2_indices = cells[1]
+
+        # Get coordinates of the two endpoints
+        point1_coords = positions[point1_indices]  # (num_springs, 3)
+        point2_coords = positions[point2_indices]  # (num_springs, 3)
+
+        # Calculate midpoints
+        midpoints = (point1_coords + point2_coords) / 2.0
+        midpoints = torch.tensor(midpoints, dtype=torch.float32).to(self.device)  # 转换为 PyTorch 张量并移动到设备上
+
+        # Normalize midpoints to [-1, 1] 
+        max_x, max_y, max_z = positions.max(axis=0)
+        min_x, min_y, min_z = positions.min(axis=0)
+        midpoints[:, 0] = 2 * (midpoints[:, 0] - min_x) / (max_x - min_x) - 1
+        midpoints[:, 1] = 2 * (midpoints[:, 1] - min_y) / (max_y - min_y) - 1
+        midpoints[:, 2] = 2 * (midpoints[:, 2] - min_z) / (max_z - min_z) - 1
+        return midpoints
+
     def _create_dataset_offline(self, mode='train', stride=1):
         if mode == 'train':
             prob = np.random.rand()
             add_noise = False # (prob < 0.667)
-            mdata = self.dataset_class(self.args.data_dir,
+            mdata = spring_mass_dataset.MeshSpringMassDataset(self.args.data_dir,
                                         layer_num=self.args.multi_mesh_layer,
                                         stride=stride,
                                         noise_shuffle=add_noise,
@@ -211,7 +252,7 @@ class SpringMassTrainer:
                                         object_case=self.args.object_case,
                                         args=self.args)
         else:
-            mdata = self.dataset_class(self.args.data_dir,
+            mdata = spring_mass_dataset.MeshSpringMassDataset(self.args.data_dir,
                                         layer_num=self.args.multi_mesh_layer,
                                         stride=stride,
                                         noise_shuffle=False,
@@ -222,87 +263,96 @@ class SpringMassTrainer:
                                         args=self.args)
         return mdata
     
-    def generate_data_point_sequence(self, update_frame_num, enable_backward=False, set_object_point=True):
+    def generate_data_point_sequence(self, update_frame_num, enable_backward=False, default_loss=None):
         simulator = self.model.module.simulator
         vertices_sequence = []
         velocities_sequence = []
+        grad_spring_Y_sequence = []
 
         # [修改] 定义 Warp 端的 Loss 累加器
-        loss_accum = None
-        tape = None
-
-        torch_device = cfg.device
-        if isinstance(torch_device, torch.device):
-             if torch_device.type == 'cuda':
-                 # 转换为 "cuda:0", "cuda:1" 等
-                 wp_device_str = f"cuda:{torch_device.index if torch_device.index is not None else 0}"
-             else:
-                 wp_device_str = "cpu"
-        else:
-             wp_device_str = str(torch_device)
+        losses = []
         
         # 将 cfg.device 更新为 Warp 兼容的字符串或直接获取 Warp device 对象
-        # 建议直接获取 Warp device 对象以避免后续歧义
-        warp_device = wp.get_device(wp_device_str)
-        
-        if enable_backward:
-            loss_accum = wp.zeros(1, dtype=float, device=warp_device, requires_grad=True)
-            # [修改] 开始录制 Tape
-            tape = simulator.tape
-        
+   
         # 初始状态记录 ... (保持不变)
         simulator.set_init_state(simulator.wp_init_vertices, simulator.wp_init_velocities)
         vertices_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[0].wp_x).clone(), wp.to_torch(simulator.wp_states[0].wp_control_x).clone()]))
         velocities_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[0].wp_v).clone(), wp.to_torch(simulator.wp_states[0].wp_control_v).clone()]))
 
-        # [修改] 将循环包裹在 Tape 上下文中（如果开启反向传播）
-        # 注意：Warp 的 Tape 需要包裹整个仿真过程
-        context_manager = tape if enable_backward else open(os.devnull) # 简单的上下文占位符
+        context_manager = simulator.tape if enable_backward else open(os.devnull) # 简单的上下文占位符
         
-        with context_manager: 
-            for frame_idx in range(1, update_frame_num):
-                simulator.set_controller_target(frame_idx, pure_inference=not set_object_point)
-                
-                # Record data
-                vertices_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_x).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_x).clone()]))
-                velocities_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_v).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_v).clone()]))
-                
-                if simulator.object_collision_flag:
-                    simulator.update_collision_graph()
-                
-                # 运行仿真步
-                simulator.step()
-                
-                # 计算 Loss
-                if enable_backward:
-                    if cfg.data_type == "real":
-                        simulator.calculate_loss()
-                    else:
-                        simulator.calculate_simple_loss()
+        valid_frames = 0
+        for frame_idx in tqdm(range(1, update_frame_num)):
+            print(f"Simulating frame {frame_idx}/{update_frame_num}...")
+            simulator.set_controller_target(frame_idx)
+            
+            # Record data
+            vertices_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_x).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_x).clone()]))
+            velocities_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_v).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_v).clone()]))
+
+
+            if simulator.object_collision_flag:
+                simulator.update_collision_graph()
+
+            # 计算 Loss
+            if cfg.data_type == "real":
+                with context_manager:
+                    simulator.step()
+                    simulator.calculate_loss()
+            else:
+                with context_manager:
+                    simulator.step()
+                    simulator.calculate_simple_loss()
                     
-                    # [关键修改] 使用 Kernel 在 Warp 内部累加 Loss
-                    # simulator.loss 通常是一个大小为1的数组
-                    wp.launch(kernel=accum_loss_kernel, dim=1, inputs=[loss_accum, simulator.loss])
+            if default_loss is not None:
+                simulator.tape.backward(simulator.loss)
 
-                simulator.set_init_state(simulator.wp_states[-1].wp_x, simulator.wp_states[-1].wp_v, pure_inference=True)
-                if cfg.data_type == "real" and frame_idx > 1:
-                    simulator.update_acc()
-                    simulator.set_acc_count(True)
+            valid_frames += 1
 
+            # 2. 提取 spring_Y 的梯度
+            grad_spring_Y = wp.to_torch(simulator.wp_spring_Y.grad).clone()
+            loss = wp.to_torch(simulator.loss, requires_grad=False)
+
+            if (default_loss and (loss.item() > (default_loss[frame_idx-1] * 1.005))) or (torch.isnan(grad_spring_Y).any()):
+                break
+
+            losses.append(loss.item())
+
+            # grad_spring_Y clip
+            grad_spring_Y = torch.clamp(grad_spring_Y, min=-1000.0, max=1000.0)            
+            grad_spring_Y_sequence.append(grad_spring_Y)
+
+            if cfg.use_graph:
+                # Only need to clear the gradient, the tape is created in the graph
+                simulator.tape.zero()
+            else:
+                # Need to reset the compute graph and clear the gradient
+                simulator.tape.reset()
+
+            simulator.clear_loss()
+
+            simulator.set_init_state(
+                simulator.wp_states[-1].wp_x, 
+                simulator.wp_states[-1].wp_v
+            )
+                
         # 转换输出张量 ... (保持不变)
         vertices_tensor = torch.stack(vertices_sequence, dim=0)
         velocities_tensor = torch.stack(velocities_sequence, dim=0)
         node_mass = torch.cat([wp.to_torch(simulator.wp_masses).clone(), torch.zeros(simulator.num_control_points, device=vertices_tensor.device)])
         spring_Y = wp.to_torch(simulator.wp_spring_Y).clone()
-        
+
         spring_reset_length = wp.to_torch(simulator.wp_rest_lengths).clone()
         spring_dashpot_damping = simulator.dashpot_damping
-
         drag_damping = simulator.drag_damping
 
         if enable_backward:
-            # [关键修改] 返回 tape 和 loss_accum (Warp 变量)，而不是 Python float
-            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping, tape, loss_accum
+            if len(grad_spring_Y_sequence) == 0:
+                import pdb; pdb.set_trace()
+            grad_spring_Y_avg = torch.mean(torch.stack(grad_spring_Y_sequence, dim=0), dim=0)  # 计算平均梯度
+
+            # 返回平均梯度
+            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping, losses, grad_spring_Y_avg, valid_frames
         else:
             return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping
 
@@ -312,128 +362,91 @@ class SpringMassTrainer:
                   ):
         torch.cuda.memory._record_memory_history(max_entries=100000)
 
+        self.model.module.simulator.set_init_state(
+            self.model.module.simulator.wp_init_vertices, 
+            self.model.module.simulator.wp_init_velocities
+        )
+
+        _, _, _, _, _, _, _, losses, grad_spring_Y_avg, valid_frames = self.generate_data_point_sequence(
+                update_frame_num=self.mdata.train_frame,
+                enable_backward=True,
+        )
+
+
         if mode != 'train':
             self.model.eval()
         mean_loss_insts = 0
-        count_insts = 0
 
-        # optimization
-        self.optimizer.zero_grad()
+        for interval in range(min(10, self.mdata.train_frame), self.mdata.train_frame, 10):
 
-        # Update simulator with predicted mechanical properties
-        # Note: You may need to adjust this based on actual mech_info structure
-        st = time()
-        # if spring_mech_info is not None and spring_mech_info.dim() == 2:  # Shape: (N, feature_dim)
-        #     # Extract and assign predicted properties to simulator
-        #     # This is a placeholder - adjust based on your model's output structure
-        #     predicted_spring_Y = spring_mech_info[:, 0]  # Young's modulus
-        #     self.model.module.simulator.wp_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32)
+            # optimization
+            self.optimizer.zero_grad()
 
-        #     predicted_rest_length = spring_mech_info[:, 1]
-        #     self.model.module.simulator.wp_rest_lengths = wp.from_torch(predicted_rest_length.contiguous(), dtype=wp.float32)
-        
-        # Raw Data preparation part, Using warp and init spring mech guess to generate data sequence for estimated surface and interior points
-        train_node_pos, train_node_vel, train_node_mass, train_log_spring_Y,\
-              spring_reset_length, spring_dashpot_damping, drag_damping =\
-                  self.generate_data_point_sequence(self.mdata.train_frame) 
-
-        import pdb; pdb.set_trace()
-        # Print spring_Y average and simulator parameters
-        print(f"\n{'='*60}")
-        print(f"Spring_Y Average: {train_log_spring_Y.mean().item():.6f}")
-        print(f"Spring Dashpot Damping: {spring_dashpot_damping}")
-        print(f"Drag Damping: {drag_damping}")
-        print(f"\nCollision Parameters:")
-        print(f"  collide_elas: {wp.to_torch(self.model.module.simulator.wp_collide_elas).item():.6f}")
-        print(f"  collide_fric: {wp.to_torch(self.model.module.simulator.wp_collide_fric).item():.6f}")
-        print(f"  collide_object_elas: {wp.to_torch(self.model.module.simulator.wp_collide_object_elas).item():.6f}")
-        print(f"  collide_object_fric: {wp.to_torch(self.model.module.simulator.wp_collide_object_fric).item():.6f}")
-        print(f"{'='*60}\n")
-
-        # Data Process
-        node_in_feature, edge_mech_in_feature, node_tar = self.mdata._preprocess(
-            train_node_pos, train_node_vel, train_node_mass,
-              train_log_spring_Y, spring_reset_length,
-              spring_dashpot_damping, drag_damping
-        )
-        import pdb; pdb.set_trace()
-        m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature, node_tar =\
-              self._preproc_multi_infos(self.mdata, node_in_feature, edge_mech_in_feature, node_tar)
-
-        # Encoder part
-        mech_info = self.model(m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature, node_tar)
-        
-        # 解析预测值
-        predicted_log_spring_Y = mech_info[:, 0]
-        predicted_rest_length = mech_info[:, 1]
-        
-        # [关键] 映射到 Warp 时，必须设置 requires_grad=True
-        # 这样 Warp 才会为这些数组分配梯度缓冲区，供 Tape 使用
-        wp_predicted_spring_Y = wp.from_torch(predicted_log_spring_Y.contiguous(), dtype=wp.float32, requires_grad=True)
-        wp_predicted_rest_length = wp.from_torch(predicted_rest_length.contiguous(), dtype=wp.float32, requires_grad=True)
-        
-        self.model.module.simulator.wp_spring_Y = wp_predicted_spring_Y
-        self.model.module.simulator.wp_rest_lengths = wp_predicted_rest_length
-
-        print("Forward time is : {}".format(time() - st))
-        st = time()
-        # 运行仿真
-        if mode == 'train':
-            # 获取 tape 和 loss_accum
-            pos, vel, _, _, _, _, _, tape, loss_accum = self.generate_data_point_sequence(
-                update_frame_num=self.mdata.train_frame,
-                enable_backward=True,
-                set_object_point=False
-            )
-
-            # 获取 Loss 的数值用于统计 (float)
-            loss_val = wp.to_torch(loss_accum).item()
-
-            # -------------------------------------------------------
-            # [核心修复] 手动梯度桥接流程
-            # -------------------------------------------------------
+            # Update simulator with predicted mechanical properties
+            # Note: You may need to adjust this based on actual mech_info structure
+            st = time()
+            spring_pos = self.get_spring_midpoints()
+            new_spring_Y = self.model(spring_pos)[:, 0]
+            log_new_spring_Y = torch.log(new_spring_Y + 1e-8)  # 添加小值避免 log(0)
             
-            # 1. Warp 反向传播: 计算 loss_accum 对 simulator.wp_spring_Y 的梯度
-            tape.backward(loss=loss_accum)
-
-            # 2. 提取 Warp 计算出的梯度，转为 PyTorch 张量
-            # 注意：如果 Warp 梯度为 None (未参与计算)，则设为 0
-            grad_spring_Y = wp.to_torch(wp_predicted_spring_Y.grad).clone() if wp_predicted_spring_Y.grad else torch.zeros_like(predicted_spring_Y)
-            grad_rest_length = wp.to_torch(wp_predicted_rest_length.grad).clone() if wp_predicted_rest_length.grad else torch.zeros_like(predicted_rest_length)
-
-            # 3. 将梯度手动注入 PyTorch 计算图
-            # 我们对模型输出的 predicted_spring_Y 调用 backward，并传入 Warp 算出的梯度
-            torch.autograd.backward(
-                tensors=[predicted_log_spring_Y, predicted_rest_length],
-                grad_tensors=[grad_spring_Y, grad_rest_length]
-            )
-
-            # 4. PyTorch 优化器更新神经网络参数
-            self.optimizer.step()
-            print(f"Elas Grad: {self.torch_collide_elas.grad}")
-            print(f"Elas Grad: {self.torch_collide_fric.grad}")
             
-        else:
-            # 验证模式不需要 tape
-            _, _, _, _, _, _, _, loss = self.generate_data_point_sequence(
-                update_frame_num=self.mdata.train_frame,
-                enable_backward=False,
-                set_object_point=False
-            )
-            loss_val = loss if isinstance(loss, float) else loss # 处理验证集返回值
+            # [关键] 映射到 Warp 时，必须设置 requires_grad=True
+            # 这样 Warp 才会为这些数组分配梯度缓冲区，供 Tape 使用
+            wp_predicted_spring_Y = wp.from_torch(log_new_spring_Y.contiguous(), dtype=wp.float32, requires_grad=True)
 
-        print("Backward time : {}".format(time() - st))
-        # stats
-        mean_loss = loss_val
-        count = 1  # Number of samples in this batch
+            self.model.module.simulator.wp_spring_Y = wp_predicted_spring_Y
+
+            print("Forward time is : {}".format(time() - st))
+            st = time()
+            # 运行仿真
+            if mode == 'train':
+                # 获取平均梯度
+                pos, vel, _, _, _, _, _, loss_val, grad_spring_Y_avg, valid_frames = \
+                    self.generate_data_point_sequence(
+                    update_frame_num=interval,
+                    enable_backward=True,
+                    default_loss=losses,
+                )
+
+                # Print spring_Y average
+                print(f"\n{'='*60}")
+                print(f"Spring_Y Average: {new_spring_Y.mean().item():.6f}")
+                print(f"Loss value: {np.mean(loss_val):.10f}, default loss: {np.mean(losses):.10f}")
+                print(f"Valid frames: {valid_frames}")
+                print(f"{'='*60}\n")
+
+                # -------------------------------------------------------
+                # [核心修复] 使用平均梯度更新模型
+                # -------------------------------------------------------
+
+                # 将平均梯度手动注入 PyTorch 计算图
+                torch.autograd.backward(
+                    tensors=[log_new_spring_Y],
+                    grad_tensors=[grad_spring_Y_avg]
+                )
+
+                # PyTorch 优化器更新神经网络参数
+                self.optimizer.step()
+                print(f"Model updated with average gradient per frame")
+
+            else:
+                # 验证模式不需要 tape
+                _, _, _, _, _, _, _, loss = self.generate_data_point_sequence(
+                    update_frame_num=self.mdata.train_frame,
+                    enable_backward=False,
+                    set_object_point=False
+                )
+                loss_val = loss if isinstance(loss, float) else loss # 处理验证集返回值
+
+            print("Backward time : {}".format(time() - st))
+            # stats
+            mean_loss = np.mean(loss_val) if isinstance(loss_val, list) else loss_val
 
         # stats
         with torch.autograd.no_grad():
             mean_loss_insts += mean_loss
-            count_insts += count
 
         # stats
-        mean_loss_insts /= count_insts
         if mode == 'train':
             # opt scheduler
             if epoch < self.args.warmup_epochs:
@@ -446,7 +459,9 @@ class SpringMassTrainer:
         else:
             self.model.eval()
 
-        final_mech_info = mech_info.detach()
+        final_mech_info = torch.stack([new_spring_Y, self.spring_rest_length]
+                                       , dim=0).detach()  # 这里根据实际 mech_info 结构调整
+
         return mean_loss_insts, final_mech_info
 
     

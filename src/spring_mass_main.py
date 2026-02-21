@@ -82,7 +82,11 @@ if __name__ == "__main__":
 
     device = torch.device("cuda", args.local_rank)
     print("device", device)
-    trainer = SpringMassTrainer(args, device)
+    if args.case == 'spring_mass':
+        trainer = SpringMassTrainer(args, device)
+    elif args.case == 'neural_spring_field':
+        from NSF_trainer import NSFTrainer
+        trainer = NSFTrainer(args, device)
     if MODE(args.mode) == MODE.Train:
         print('Train')
         trainer.train()

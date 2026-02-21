@@ -73,7 +73,7 @@ class SpringMass(ModelGeneral):
         self.init_springs = torch.tensor(init_springs.T, dtype=torch.int32).contiguous().to(device)
         self.init_rest_lengths = torch.FloatTensor(init_rest_lengths).contiguous().to(device)
         self.init_masses = torch.FloatTensor(init_masses).contiguous().to(device)
-        self.init_spring_Y = torch.FloatTensor(init_spring_Y).contiguous().to(device)
+        self.init_spring_Y = init_spring_Y
         self.object_visibilities = torch.FloatTensor(object_visibilities).contiguous().to(device)
         self.object_motions_valid = torch.FloatTensor(object_motions_valid).contiguous().to(device)
         self.init_velocities = torch.FloatTensor(init_velocities).contiguous().to(device)
@@ -106,11 +106,11 @@ class SpringMass(ModelGeneral):
             self.init_masses,
             dt=self.dt,
             num_substeps=self.num_substeps,
-            spring_Y=self.init_spring_Y,
+            spring_Y=self.init_spring_Y, 
             collide_elas=self.collide_elas, 
             collide_fric=self.collide_fric, 
-            dashpot_damping=self.dashpot_damping,
-            drag_damping=self.drag_damping,
+            dashpot_damping=int(self.dashpot_damping), # DEBUG
+            drag_damping=int(self.drag_damping), # DEBUG
             collide_object_elas=self.collide_object_elas,
             collide_object_fric=self.collide_object_fric,
             init_masks=init_masks,
@@ -123,9 +123,9 @@ class SpringMass(ModelGeneral):
             reverse_z=self.reverse_z,
             spring_Y_min=self.spring_Y_min,
             spring_Y_max=self.spring_Y_max,
-            gt_object_points=self.object_points, # DEBUG
-            gt_object_visibilities=self.object_visibilities,
-            gt_object_motions_valid=self.object_motions_valid,
+            gt_object_points=self.object_points, 
+            gt_object_visibilities=self.object_visibilities.bool(),
+            gt_object_motions_valid=self.object_motions_valid.bool(),
             self_collision=self.self_collision,
         )
 
@@ -315,7 +315,9 @@ class SpringMass(ModelGeneral):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
-            
+        # node_in shape T * N * C
+        # edge_mech_in shape T * E * C_edge
+
         # get mat pos and type
         node_pos, node_vel, node_type = self._get_pos_type(node_in)
 

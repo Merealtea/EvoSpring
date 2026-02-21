@@ -14,5 +14,5 @@ batch=1
 lr=3e-4
 gamma=0.79432823472
 object_case='double_lift_zebra'
-data_dir='/mnt/pool1/cxy/phystwin-v2/evomesh_optimization_outputs'
+data_dir='./evomesh_optimization_outputs'
 dump_dir='./res/springmass/'

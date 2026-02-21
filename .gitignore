@@ -1,3 +1,7 @@
 __pycache__
 res
 *.mp4
+evomesh_optimization_outputs
+experiments
+experiments_optimization
+data

@@ -124,8 +124,8 @@ class MeshGeneralDataset(Dataset):
     def _read_normalization_info(self, in_normal_feature_list, out_normal_feature_list, roll_normal_feature_list):
         # collect in normalization
         for i, fea in enumerate(in_normal_feature_list):
-            temp_std = torch.tensor(self.meta['normalization_info'][fea]['std'], dtype=torch.float)
-            temp_mean = torch.tensor(self.meta['normalization_info'][fea]['mean'], dtype=torch.float)
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
+            temp_mean = torch.tensor(self.normalization_info[fea]['mean'], dtype=torch.float)
             if i == 0:
                 self.std_in = temp_std
                 self.mean_in = temp_mean
@@ -134,8 +134,8 @@ class MeshGeneralDataset(Dataset):
                 self.mean_in = torch.cat((self.mean_in, temp_mean), dim=-1)
         # collect out normalization
         for i, fea in enumerate(out_normal_feature_list):
-            temp_std = torch.tensor(self.meta['normalization_info'][fea]['std'], dtype=torch.float)
-            temp_mean = torch.tensor(self.meta['normalization_info'][fea]['mean'], dtype=torch.float)
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
+            temp_mean = torch.tensor(self.normalization_info[fea]['mean'], dtype=torch.float)
             if i == 0:
                 self.std_out = temp_std
                 self.mean_out = temp_mean
@@ -145,11 +145,11 @@ class MeshGeneralDataset(Dataset):
         # collect roll-out normalization
         self.roll_l = 0
         for i, fea in enumerate(roll_normal_feature_list):
-            temp_std = torch.tensor(self.meta['normalization_info'][fea]['std'], dtype=torch.float)
+            temp_std = torch.tensor(self.normalization_info[fea]['std'], dtype=torch.float)
             self.roll_l += temp_std.shape[-1]
         # NOTE assume/let all leading features align with the list ordering here
-        self.in_norm_l = self.std_in.shape[0]
-        self.out_norm_l = self.std_out.shape[0]
+        self.in_norm_l = 3
+        self.out_norm_l = 3
 
     def _normalize(self, t_in, t_out):
         device = t_in.device
