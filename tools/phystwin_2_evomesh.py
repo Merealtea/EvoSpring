@@ -239,7 +239,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
         'init_spring_Y' : global_spring_Y,
         'spring_Y' : spring_property[None, :, None].repeat(T, axis=0),
         'spring_dashpot_damping' : dashpot_damping * np.ones((T, K, 1), dtype=np.float32),
-        'spring_reset_length' : rest_lengths[None, :, None].repeat(T, axis=0),
+        'spring_rest_length' : rest_lengths[None, :, None].repeat(T, axis=0),
         "controller_point" : data_pos[:, N_obj + N_surface + N_interior:],
         "object_colors" : object_colors,
         "object_visibilities" : object_visibilities,

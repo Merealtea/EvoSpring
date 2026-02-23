@@ -52,7 +52,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
             self.mesh_pos = np.array(f['mesh_pos'])[0]
        
             self.init_spring_Y = float(np.array(f['init_spring_Y']))
-            self.spring_reset_length = np.array(f['spring_reset_length'])[0,:,0]
+            self.spring_rest_length = np.array(f['spring_reset_length'])[0,:,0]
             self.spring_dashpot_damping = np.array(f['spring_dashpot_damping'])[0,:,0]
             self.masses = np.array(f['mass'])[0,:,0]
             self.velocity = np.array(f['velocities'])[0]
@@ -228,7 +228,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
                     device, mode='train'):
         T, num_node, geo_dim = node_pos.shape
 
-        # normalization for node_pos 和 log_spring_Y, spring_reset_length
+        # normalization for node_pos 和 log_spring_Y, spring_rest_length
         # TODO : add normalization for edge features
 
         node_pos, spring_Y, spring_rest_length = self._normalize(node_pos, 
@@ -255,7 +255,7 @@ class MeshSpringMassDataset(MeshGeneralDataset):
         # [node_pos, node_vel] * T, node_ 12:13 node_mass 13:16 node_damping, 16: type
         node_inp_info = torch.cat((node_inp_info, node_mass, node_type), dim=-1)
 
-        # concat spring_Y, spring_reset_length, dashpot_damping as edge features, and repeat for both directions
+        # concat spring_Y, spring_rest_length, dashpot_damping as edge features, and repeat for both directions
         edge_in_info = torch.cat((spring_force, dashpot_force), dim=-1)[:-1]
 
         spring_Y = spring_Y[None, :].repeat(T-1, 1, 1)

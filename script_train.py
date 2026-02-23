@@ -2,7 +2,7 @@ import glob
 import os
 import json
 
-case = 'neural_spring_field'
+case = 'evospring'
 CONFIG_FILE=f"./configs/{case}"
 # 0: train 1: local test 2: global
 MODE=0
@@ -49,4 +49,6 @@ for case_name in dir_names:
             -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
             -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
     )
+
+    break
 

@@ -87,6 +87,10 @@ if __name__ == "__main__":
     elif args.case == 'neural_spring_field':
         from NSF_trainer import NSFTrainer
         trainer = NSFTrainer(args, device)
+    elif args.case == 'evospring':
+        from EvoSpring_trainer import EvoSpringTrainer
+        trainer = EvoSpringTrainer(args, device)
+    
     if MODE(args.mode) == MODE.Train:
         print('Train')
         trainer.train()
