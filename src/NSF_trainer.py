@@ -35,9 +35,9 @@ class NSFTrainer:
         
         mdata = self._create_dataset_offline(mode='train')
 
-        num_springs = len(mdata.spring_reset_length)
+        num_springs = len(mdata.spring_rest_length)
         init_spring_Y = torch.ones(num_springs).to(self.device) * mdata.init_spring_Y
-        spring_rest_length = torch.tensor(mdata.spring_reset_length).to(self.device)
+        spring_rest_length = torch.tensor(mdata.spring_rest_length).to(self.device)
 
         self.spring_rest_length = spring_rest_length
 
@@ -59,7 +59,7 @@ class NSFTrainer:
             init_vertices = mdata.mesh_pos,
             init_springs = mdata.cells,
             init_spring_Y = mdata.init_spring_Y,
-            init_rest_lengths = mdata.spring_reset_length,
+            init_rest_lengths = mdata.spring_rest_length,
             init_masses = mdata.masses,
             num_object_springs = mdata.cells.shape[0],
             init_masks = None,
@@ -197,7 +197,8 @@ class NSFTrainer:
             if mech_info.dim() == 2:
                 predicted_spring_Y = mech_info[:, 0]
                 predicted_rest_length = mech_info[:, 1]
-                simulator.update_spring_properties(predicted_spring_Y, predicted_rest_length)
+                wp_predicted_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32, requires_grad=False)
+                simulator.set_spring_Y(wp_predicted_spring_Y)
             else:
                 logger.warning("mech_info has unexpected dimensions, skipping property update")
 
@@ -440,7 +441,7 @@ class NSFTrainer:
         node_mass = torch.cat([wp.to_torch(simulator.wp_masses).clone(), torch.zeros(simulator.num_control_points, device=vertices_tensor.device)])
         spring_Y = wp.to_torch(simulator.wp_spring_Y).clone()
 
-        spring_reset_length = wp.to_torch(simulator.wp_rest_lengths).clone()
+        spring_rest_length = wp.to_torch(simulator.wp_rest_lengths).clone()
         spring_dashpot_damping = simulator.dashpot_damping
         drag_damping = simulator.drag_damping
 
@@ -452,9 +453,9 @@ class NSFTrainer:
                 grad_spring_Y_avg = torch.sum(torch.stack(grad_spring_Y_sequence, dim=0), dim=0)  # 计算平均梯度
 
             # 返回平均梯度
-            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping, losses, grad_spring_Y_avg, valid_frames
+            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_rest_length, spring_dashpot_damping, drag_damping, losses, grad_spring_Y_avg, valid_frames
         else:
-            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_reset_length, spring_dashpot_damping, drag_damping
+            return vertices_tensor, velocities_tensor, node_mass, spring_Y, spring_rest_length, spring_dashpot_damping, drag_damping
 
 
     def run_epoch(self, epoch, 
@@ -685,7 +686,7 @@ class NSFTrainer:
         best_loss = np.mean(frame_losses[:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
 
         # get initial mech_info from zero-grad optimization results
-        spring_rest_length = torch.FloatTensor(self.mdata.spring_reset_length).to(self.device)
+        spring_rest_length = torch.FloatTensor(self.mdata.spring_rest_length).to(self.device)
         init_spring_Y = torch.log(torch.ones_like(spring_rest_length) * self.mdata.init_spring_Y)
         default_mech = torch.stack([init_spring_Y, spring_rest_length], dim=1)
 
@@ -880,7 +881,7 @@ class NSFTrainer:
             init_vertices=mdata.mesh_pos,
             init_springs=mdata.cells,
             init_spring_Y=mdata.spring_Y[0],
-            init_rest_lengths=mdata.spring_reset_length,
+            init_rest_lengths=mdata.spring_rest_length,
             init_masses=mdata.masses,
             num_object_springs=mdata.spring_Y.shape[0],
             init_masks=None,
