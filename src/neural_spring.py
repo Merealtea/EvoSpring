@@ -224,6 +224,9 @@ class NeuralSpringField(nn.Module):
         delta_S = self.mlp(feat_pe)
         
         # 7. Add to the initialization parameter S_0
-        S_e = self.S_0[:, None] + delta_S
+        S_e = self.S_0[:, None] + delta_S * 100
         
+        # clip 
+        S_e = torch.clamp(S_e, 1e-2, cfg.spring_Y_max)
+
         return S_e

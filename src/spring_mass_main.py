@@ -74,7 +74,7 @@ if __name__ == "__main__":
     seed_everything(0)
     args = getargs()
     args.consist_mesh = bool(args.consist_mesh)
-    args.dump_dir = os.path.join(args.dump_dir, 'ours')
+    args.dump_dir = os.path.join(args.dump_dir, args.object_case)
     print(args)
     torch.cuda.set_device(args.local_rank)
     torch.distributed.init_process_group(backend='nccl')
