@@ -356,7 +356,7 @@ class SpringMass(ModelGeneral):
         # edge_mech_in_bias = torch.tanh(bias)
         # edge_mech_in_bias = torch.tanh(edge_mech_in_bias)
 
-        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] * 100
+        edge_mech_in_bias[..., 0] = edge_mech_in_bias[..., 0] 
         edge_mech_in_bias[..., 1] = edge_mech_in_bias[..., 1] * 0.00000
 
         return edge_mech_in_bias

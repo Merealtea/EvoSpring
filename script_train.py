@@ -33,10 +33,12 @@ dir_names = os.listdir(base_path)
 finished_cases = os.listdir(res_path)
 
 for case_name in dir_names:
+    # case_name = 'single_clift_cloth_3' # DEBUG
+
     print(f"Running case: {case_name}")
-    if case_name in finished_cases:
-        print(f"Case {case_name} already finished, skipping.")
-        continue
+    # if case_name in finished_cases:
+    #     print(f"Case {case_name} already finished, skipping.")
+    #     continue
     os.system(
         f"python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
             -case {case} -space_dim {config['space_dim']} -local_rank {local_rank} \
@@ -47,4 +49,5 @@ for case_name in dir_names:
             -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
             -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
     )
+
 

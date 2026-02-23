@@ -368,8 +368,8 @@ class SpringMassTrainer:
         simulator.set_init_state(prev_point_pos, prev_point_vel)
 
         # 使用支持梯度的方法更新simulator的弹簧属性
-        simulator.update_spring_properties(predicted_log_spring_Y, 
-                                           predicted_rest_length)
+        # import pdb; pdb.set_trace()
+        simulator.update_spring_properties(predicted_log_spring_Y, predicted_rest_length)
 
         if enable_backward:
             tape = simulator.tape
@@ -399,6 +399,7 @@ class SpringMassTrainer:
                             simulator.step()
                             simulator.calculate_simple_loss()
                         tape.backward(simulator.loss)
+            
 
             # if cfg.data_type == "real" and frame_idx > 1:
             #     simulator.update_acc()
@@ -672,198 +673,198 @@ class SpringMassTrainer:
                 frame_init_vertices = wp.to_torch(simulator.wp_states[0].wp_x).detach().clone()
                 frame_init_velocities = wp.to_torch(simulator.wp_states[0].wp_v).detach().clone()
 
-                pos, vel, node_mass, spring_Y, spring_rest_length, \
-                    drag_damping, spring_force, dashpot_force, overall_forces = \
-                    self.get_single_frame_data(frame_idx, m_gs, use_gt=True)
-
-                while ((frame_error > np.mean(prev_epoch_loss[frame_idx : frame_idx + steps])) and (retry_times < max_iter)):
+                # while ((frame_error > np.mean(prev_epoch_loss[frame_idx : frame_idx + steps])) and (retry_times < max_iter)):
                     # DEBUG : single frame overfit test
-                    frame_error = 0
-   
-                    simulator.set_init_state(
-                        wp.from_torch(frame_init_vertices, dtype=wp.vec3, requires_grad=False),
-                        wp.from_torch(frame_init_velocities, dtype=wp.vec3, requires_grad=False)
-                    )
+                frame_error = 0
+
+                simulator.set_init_state(
+                    wp.from_torch(frame_init_vertices, dtype=wp.vec3, requires_grad=False),
+                    wp.from_torch(frame_init_velocities, dtype=wp.vec3, requires_grad=False)
+                )
+                
+                for sub_frame_idx in range(frame_idx, min(frame_idx + steps, self.mdata.train_frame)):
                     
-                    for sub_frame_idx in range(frame_idx, min(frame_idx + steps, self.mdata.train_frame)):
-                        
-                        # print(f"\n--- Processing Frame {sub_frame_idx}/{self.mdata.train_frame-1} ---")
-                        
-                        self.optimizer.zero_grad()
-                        # 获取当前帧数据（前一帧和当前帧）
-                        
-                        node_in_feature, edge_in_feature = self.mdata._preprocess(
-                            pos, vel, node_mass,
-                            spring_Y.detach(), spring_rest_length.detach(),
-                            drag_damping, spring_force, dashpot_force, 
-                            overall_forces, device=self.device
+                    # print(f"\n--- Processing Frame {sub_frame_idx}/{self.mdata.train_frame-1} ---")
+                    
+                    # self.optimizer.zero_grad()
+                    # 获取当前帧数据（前一帧和当前帧）
+
+                    pos, vel, node_mass, spring_Y, spring_rest_length, \
+                        drag_damping, spring_force, dashpot_force, overall_forces = \
+                        self.get_single_frame_data(frame_idx, m_gs, use_gt=True)
+                    
+                    node_in_feature, edge_in_feature = self.mdata._preprocess(
+                        pos, vel, node_mass,
+                        spring_Y.detach(), spring_rest_length.detach(),
+                        drag_damping, spring_force, dashpot_force, 
+                        overall_forces, device=self.device
+                    )
+
+                    # # 3. 模型预测机械属性
+                    # # st = time()
+
+                    # # spring_Y 和 rest_length 的预测值是基于 edge_in_feature 的，因此我们需要将 edge_in_feature 传入模型进行预测
+                    edge_mech_in_bias = self.model(m_ids, m_gs, m_gs_parent, 
+                                            node_in_feature, 
+                                            edge_in_feature)
+
+                    # print(f"edge_mech_in_bias mean: {edge_mech_in_bias[:,0].mean().item():.6f}, std: {edge_mech_in_bias.std().item():.6f}")
+                    # print(f"edge_mech_in_bias min: {edge_mech_in_bias[:,0].min().item():.6f}, max: {edge_mech_in_bias[:,0].max().item():.6f}")
+                    # print(f"edge_mech_in_bias max: {edge_mech_in_bias[:,0].max().item():.6f}")
+
+                    num_edge = spring_Y.shape[0]
+
+                    new_spring_Y = torch.exp(spring_Y[:num_edge // 2, 0]).detach() + edge_mech_in_bias[:, 0]
+                    new_rest_length = spring_rest_length[:num_edge // 2, 0].detach() + edge_mech_in_bias[:, 1]
+
+                    new_spring_Y = torch.log(torch.clip(new_spring_Y, 1e-2, cfg.spring_Y_max))
+                    new_rest_length = torch.clip(new_rest_length, 2e-10, self.mdata.max_radius)
+
+                    # for name, param in self.model.named_parameters():
+                    #     if param.requires_grad and param.grad is not None:
+                    #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item():.6f}")
+
+                    # 4. 使用预测的机械属性进行单步仿真并计算loss和反传
+                    tape, frame_loss, chamfer_loss, track_loss = \
+                        self.simulate_single_step_with_prediction(
+                            sub_frame_idx, pos[0], vel[0],
+                            new_spring_Y, new_rest_length, 
+                            enable_backward=True
                         )
 
-                        # 3. 模型预测机械属性
-                        # st = time()
+                    # # 4.5 可视化点云（每10帧或第一帧）
+                    # if sub_frame_idx % 10 == 0 or sub_frame_idx == 1:
+                    #     # 获取前一帧点云（只取object points）
+                    #     prev_points = pos[0][:simulator.num_object_points]
 
-                        # spring_Y 和 rest_length 的预测值是基于 edge_in_feature 的，因此我们需要将 edge_in_feature 传入模型进行预测
-                        edge_mech_in_bias = self.model(m_ids, m_gs, m_gs_parent, 
-                                               node_in_feature, 
-                                               edge_in_feature)
+                    #     # 获取step后的点云
+                    #     step_points = torch.cat([
+                    #         wp.to_torch(simulator.wp_states[-1].wp_x).clone(),
+                    #     ])[:simulator.num_object_points]
 
-                        print(f"edge_mech_in_bias mean: {edge_mech_in_bias[:,0].mean().item():.6f}, std: {edge_mech_in_bias.std().item():.6f}")
-                        print(f"edge_mech_in_bias min: {edge_mech_in_bias[:,0].min().item():.6f}, max: {edge_mech_in_bias[:,0].max().item():.6f}")
-                        print(f"edge_mech_in_bias max: {edge_mech_in_bias[:,0].max().item():.6f}")
+                    #     # 获取真值点云
+                    #     gt_points = self.mdata.object_point[sub_frame_idx]
+                    #     if gt_points is not None and len(gt_points) > 0:
+                    #         gt_points = torch.FloatTensor(gt_points).to(prev_points.device)
 
-                        num_edge = edge_in_feature.shape[1]
+                    #         # 调用可视化函数
+                    #         try:
+                    #             self.visualize_point_clouds(
+                    #                 prev_points=prev_points,
+                    #                 step_points=step_points,
+                    #                 gt_points=gt_points,
+                    #                 frame_idx=sub_frame_idx
+                    #             )
+                    #         except:
+                    #             import pdb; pdb.set_trace()
 
-                        new_spring_Y = torch.exp(spring_Y[:num_edge // 2, 0]).detach() + edge_mech_in_bias[:, 0]
-                        new_rest_length = spring_rest_length[:num_edge // 2, 0].detach() + edge_mech_in_bias[:, 1]
+                    # 5. 提取梯度
 
-                        new_spring_Y = torch.log(torch.clip(new_spring_Y, 1e-2, cfg.spring_Y_max))
-                        new_rest_length = torch.clip(new_rest_length, 2e-10, self.mdata.max_radius)
-
-                        # for name, param in self.model.named_parameters():
-                        #     if param.requires_grad and param.grad is not None:
-                        #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item():.6f}")
-         
-                        # 4. 使用预测的机械属性进行单步仿真并计算loss和反传
-                        tape, frame_loss, chamfer_loss, track_loss = \
-                            self.simulate_single_step_with_prediction(
-                                sub_frame_idx, pos[0], vel[0],
-                                new_spring_Y, new_rest_length, 
-                                enable_backward=True
-                            )
-
-                        # # 4.5 可视化点云（每10帧或第一帧）
-                        # if sub_frame_idx % 10 == 0 or sub_frame_idx == 1:
-                        #     # 获取前一帧点云（只取object points）
-                        #     prev_points = pos[0][:simulator.num_object_points]
-
-                        #     # 获取step后的点云
-                        #     step_points = torch.cat([
-                        #         wp.to_torch(simulator.wp_states[-1].wp_x).clone(),
-                        #     ])[:simulator.num_object_points]
-
-                        #     # 获取真值点云
-                        #     gt_points = self.mdata.object_point[sub_frame_idx]
-                        #     if gt_points is not None and len(gt_points) > 0:
-                        #         gt_points = torch.FloatTensor(gt_points).to(prev_points.device)
-
-                        #         # 调用可视化函数
-                        #         try:
-                        #             self.visualize_point_clouds(
-                        #                 prev_points=prev_points,
-                        #                 step_points=step_points,
-                        #                 gt_points=gt_points,
-                        #                 frame_idx=sub_frame_idx
-                        #             )
-                        #         except:
-                        #             import pdb; pdb.set_trace()
-
-                        # 5. 提取梯度
-                        wp_predicted_spring_Y = simulator.wp_spring_Y
-                        wp_predicted_rest_length = simulator.wp_rest_lengths
-
-                        grad_spring_Y = wp.to_torch(wp_predicted_spring_Y.grad).clone() if wp_predicted_spring_Y.grad else torch.zeros_like(new_spring_Y)
-                        grad_rest_length = wp.to_torch(wp_predicted_rest_length.grad).clone() if wp_predicted_rest_length.grad else torch.zeros_like(new_rest_length)
-
-                        # -------------------------------------------------------
-                        # [核心] 手动梯度桥接流程
-                        # -------------------------------------------------------
-                        
-                        torch.autograd.backward(
-                            tensors=[new_spring_Y, new_rest_length],
-                            grad_tensors=[grad_spring_Y, grad_rest_length],
-                        )
-
-                        # 打印模型的每一层参数和梯度信息（如果需要）
-                        # for name, param in self.model.module.named_parameters():
-                        #     if param.requires_grad and param.grad is not None:
-                        #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item()}")
-                        #     elif param.requires_grad:
-                        #         print(f"Parameter: {name} has no gradient.")
-
-                        # torch.autograd.backward(
-                        #     tensors=[new_spring_Y, new_rest_length, 
-                        #              self.torch_collide_elas, self.torch_collide_fric,
-                        #              self.torch_collide_object_elas, self.torch_collide_object_fric],
-                        #     grad_tensors=[grad_spring_Y, grad_rest_length,
-                        #                   wp.to_torch(simulator.wp_collide_elas.grad),
-                        #                   wp.to_torch(simulator.wp_collide_fric.grad),
-                        #                   wp.to_torch(simulator.wp_collide_object_elas.grad),
-                        #                   wp.to_torch(simulator.wp_collide_object_fric.grad)],
-                        # )
-
-                        # # 获取总Loss的数值用于统计
-                        loss_val = wp.to_torch(frame_loss).item()
-
-                        # print(f"Spring_Y Grad Norm: {grad_spring_Y.norm().item():.6f}")
-                        # print(f"Rest_Length Grad Norm: {grad_rest_length.norm().item():.6f}")
-
-                        # # 打印碰撞参数梯度（如果启用了collision_learn）
-                        if cfg.collision_learn:
-                            print(f"Collision Elas Grad: {wp.to_torch(simulator.wp_collide_elas.grad)}")
-                            print(f"Collision Fric Grad: {wp.to_torch(simulator.wp_collide_fric.grad)}")
-                            print(f"Collision Object Elas Grad: {wp.to_torch(simulator.wp_collide_object_elas.grad)}")
-                            print(f"Collision Object Fric Grad: {wp.to_torch(simulator.wp_collide_object_fric.grad)}")
-                        
-                        self.total_update += 1
-                        self.writer.add_scalar('Single Frame/Frame_Loss', loss_val, self.total_update)
-                        self.writer.add_scalar('Single Frame/Spring_Y_Average', new_spring_Y.mean().item(), self.total_update)
-                        self.writer.add_scalar('Single Frame/Rest_Length_Average', new_rest_length.mean().item(), self.total_update)
-
-                        # 打印仿真参数
-                        print(f"\n{'='*60}")
-                        print(f"Spring_Y Average: {new_spring_Y.mean().item():.6f}")
-                        print(f"Rest_Length Average: {new_rest_length.mean().item():.6f}")
-                        print(f"\nCollision Parameters:")
-                        print(f"  collide_elas: {wp.to_torch(self.model.module.simulator.wp_collide_elas).item():.10f}")
-                        print(f"  collide_fric: {wp.to_torch(self.model.module.simulator.wp_collide_fric).item():.10f}")
-                        print(f"  collide_object_elas: {wp.to_torch(self.model.module.simulator.wp_collide_object_elas).item():.10f}")
-                        print(f"  collide_object_fric: {wp.to_torch(self.model.module.simulator.wp_collide_object_fric).item():.10f}")
-
-                        print(f"\nLoss Breakdown:")
-                        print(f"{'='*60}\n")
-                        print(f"Frame {sub_frame_idx} Loss: {wp.to_torch(frame_loss).item():.6f}")
-                        print(f"Chamfer Loss: {chamfer_loss.item():.6f}")
-                        print(f"Track Loss: {track_loss.item():.6f}")
-
-                        # PyTorch 优化器更新神经网络参数
-                        self.optimizer.step()
-
-                        if cfg.collision_learn:
-                            # 将更新后的碰撞参数同步回simulator的wp参数
-                            with torch.no_grad():
-                                simulator.set_collide(wp.from_torch(self.torch_collide_elas, dtype=wp.float32),
-                                                     wp.from_torch(self.torch_collide_fric, dtype=wp.float32))
-                                simulator.set_collide_object(wp.from_torch(self.torch_collide_object_elas, dtype=wp.float32),
-                                                            wp.from_torch(self.torch_collide_object_fric, dtype=wp.float32))                   
-                        
-                        if cfg.use_graph:
-                            # Only need to clear the gradient, the tape is created in the graph
-                            tape.zero()
-                        else:
-                            # Need to reset the compute graph and clear the gradient
-                            tape.reset()
-                        
-                        simulator.clear_loss()
-                        # 更新状态为下一帧的初始状态
-                        simulator.set_init_state(simulator.wp_states[-1].wp_x, 
-                                                simulator.wp_states[-1].wp_v)
-                     
-                        # stats
-                        frame_error += loss_val
-                    frame_error /= steps
-                    retry_times += 1
-
-                    # 保存内存快照（每次重试后）
-                    # snapshot_path = os.path.join(memory_snapshot_dir,
-                    #                             f'epoch_{epoch}_frame_{frame_idx}_retry_{retry_times}.pickle')
-                    # try:
-                    #     torch.cuda.memory._dump_snapshot(snapshot_path)
-                    #     logger.info(f"Saved memory snapshot: {snapshot_path}")
-                    # except Exception as e:
-                    #     logger.warning(f"Failed to save memory snapshot: {e}")
+                    grad_spring_Y = wp.to_torch(simulator.wp_spring_Y.grad).clone() 
+                    grad_rest_length = wp.to_torch(simulator.wp_spring_Y.grad).clone() 
 
                     # import pdb; pdb.set_trace()
-                    print(f'Retries {retry_times}, frame error is {frame_error:.8f}, target error is {np.mean(prev_epoch_loss[frame_idx : frame_idx + steps]):.8f}')
+                    # -------------------------------------------------------
+                    # [核心] 手动梯度桥接流程
+                    # -------------------------------------------------------
+                    
+                    torch.autograd.backward(
+                        tensors=[new_spring_Y, new_rest_length],
+                        grad_tensors=[grad_spring_Y, grad_rest_length],
+                    )
+
+                    # 打印模型的每一层参数和梯度信息（如果需要）
+                    # for name, param in self.model.module.named_parameters():
+                    #     if param.requires_grad and param.grad is not None:
+                    #         print(f"Parameter: {name}, Grad Norm: {param.grad.norm().item()}")
+                    #     elif param.requires_grad:
+                    #         print(f"Parameter: {name} has no gradient.")
+
+                    # torch.autograd.backward(
+                    #     tensors=[new_spring_Y, new_rest_length, 
+                    #              self.torch_collide_elas, self.torch_collide_fric,
+                    #              self.torch_collide_object_elas, self.torch_collide_object_fric],
+                    #     grad_tensors=[grad_spring_Y, grad_rest_length,
+                    #                   wp.to_torch(simulator.wp_collide_elas.grad),
+                    #                   wp.to_torch(simulator.wp_collide_fric.grad),
+                    #                   wp.to_torch(simulator.wp_collide_object_elas.grad),
+                    #                   wp.to_torch(simulator.wp_collide_object_fric.grad)],
+                    # )
+
+                    # # 获取总Loss的数值用于统计
+                    loss_val = wp.to_torch(frame_loss).item()
+
+                    # print(f"Spring_Y Grad Norm: {grad_spring_Y.norm().item():.6f}")
+                    # print(f"Rest_Length Grad Norm: {grad_rest_length.norm().item():.6f}")
+
+                    # # 打印碰撞参数梯度（如果启用了collision_learn）
+                    if cfg.collision_learn:
+                        print(f"Collision Elas Grad: {wp.to_torch(simulator.wp_collide_elas.grad)}")
+                        print(f"Collision Fric Grad: {wp.to_torch(simulator.wp_collide_fric.grad)}")
+                        print(f"Collision Object Elas Grad: {wp.to_torch(simulator.wp_collide_object_elas.grad)}")
+                        print(f"Collision Object Fric Grad: {wp.to_torch(simulator.wp_collide_object_fric.grad)}")
+                    
+                    self.total_update += 1
+                    self.writer.add_scalar('Single Frame/Frame_Loss', loss_val, self.total_update)
+                    self.writer.add_scalar('Single Frame/Spring_Y_Average', new_spring_Y.mean().item(), self.total_update)
+                    self.writer.add_scalar('Single Frame/Rest_Length_Average', new_rest_length.mean().item(), self.total_update)
+
+                    # 打印仿真参数
+                    print(f"\n{'='*60}")
+                    print(f"Spring_Y Average: {new_spring_Y.mean().item():.6f}")
+                    print(f"Rest_Length Average: {new_rest_length.mean().item():.6f}")
+                    print(f"\nCollision Parameters:")
+                    print(f"  collide_elas: {wp.to_torch(self.model.module.simulator.wp_collide_elas).item():.10f}")
+                    print(f"  collide_fric: {wp.to_torch(self.model.module.simulator.wp_collide_fric).item():.10f}")
+                    print(f"  collide_object_elas: {wp.to_torch(self.model.module.simulator.wp_collide_object_elas).item():.10f}")
+                    print(f"  collide_object_fric: {wp.to_torch(self.model.module.simulator.wp_collide_object_fric).item():.10f}")
+
+                    print(f"\nLoss Breakdown:")
+                    print(f"{'='*60}\n")
+                    print(f"Frame {sub_frame_idx} Loss: {wp.to_torch(frame_loss).item():.6f}")
+                    print(f"Chamfer Loss: {chamfer_loss.item():.6f}")
+                    print(f"Track Loss: {track_loss.item():.6f}")
+
+                    # PyTorch 优化器更新神经网络参数
+                    # import pdb; pdb.set_trace
+                    self.optimizer.step()
+
+                    if cfg.collision_learn:
+                        # 将更新后的碰撞参数同步回simulator的wp参数
+                        with torch.no_grad():
+                            simulator.set_collide(wp.from_torch(self.torch_collide_elas, dtype=wp.float32),
+                                                    wp.from_torch(self.torch_collide_fric, dtype=wp.float32))
+                            simulator.set_collide_object(wp.from_torch(self.torch_collide_object_elas, dtype=wp.float32),
+                                                        wp.from_torch(self.torch_collide_object_fric, dtype=wp.float32))                   
+                    
+                    if cfg.use_graph:
+                        # Only need to clear the gradient, the tape is created in the graph
+                        tape.zero()
+                    else:
+                        # Need to reset the compute graph and clear the gradient
+                        tape.reset()
+                    
+                    simulator.clear_loss()
+                    # 更新状态为下一帧的初始状态
+                    simulator.set_init_state(simulator.wp_states[-1].wp_x, 
+                                            simulator.wp_states[-1].wp_v)
+                    
+                    # stats
+                    frame_error += loss_val
+                frame_error /= steps
+                retry_times += 1
+                
+                # 保存内存快照（每次重试后）
+                # snapshot_path = os.path.join(memory_snapshot_dir,
+                #                             f'epoch_{epoch}_frame_{frame_idx}_retry_{retry_times}.pickle')
+                # try:
+                #     torch.cuda.memory._dump_snapshot(snapshot_path)
+                #     logger.info(f"Saved memory snapshot: {snapshot_path}")
+                # except Exception as e:
+                #     logger.warning(f"Failed to save memory snapshot: {e}")
+
+                # import pdb; pdb.set_trace()
+                print(f'Retries {retry_times}, frame error is {frame_error:.8f}, target error is {np.mean(prev_epoch_loss[frame_idx : frame_idx + steps]):.8f}')
                 mean_loss_insts += frame_error * steps
         else:
             assert mech_info is not None, "In test mode, mech_info must be provided."
@@ -948,12 +949,11 @@ class SpringMassTrainer:
         # Early stopping parameters for mech_info convergence
         prev_mech_info = None
         mech_info_change_threshold = 1e-7  # Relative change threshold
-        patience = 5  # Number of epochs to wait before stopping
+        patience = 100  # Number of epochs to wait before stopping
         patience_counter = 0
 
         # Early stopping parameters for loss non-improvement  # Number of epochs to wait for loss improvement
         loss_patience_counter = 0
-        min_delta = 1e-6  # Minimum change in loss to qualify as improvement
 
         # Save initial trajectory before training
         initial_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'initial_trajectory.pkl')
