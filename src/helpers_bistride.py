@@ -1,6 +1,6 @@
 import numpy as np
 import scipy
-from sparse_dot_mkl import dot_product_mkl
+# from sparse_dot_mkl import dot_product_mkl
 from enum import Enum
 from helpers_convert import _flat_edge_to_adj_list, _flat_edge_to_adj_mat, _adj_mat_to_flat_edge
 from helpers_BFS import _find_clusters, _BFS_dist, _BFS_dist_all
@@ -155,7 +155,7 @@ def bstride_selection(flat_edge, seed_heuristic, pos_mesh=None, n=None):
 
 
     # double hop
-    adj_mat = dot_product_mkl(adj_mat, adj_mat)
+    adj_mat = adj_mat @ adj_mat
     adj_mat.setdiag(0)
 
     adj_mat = pool_edge(adj_mat, combined_idx_kept, n)
@@ -189,8 +189,8 @@ def multi_layer_contact_edge(m_gs, multi_layer_idx, pos, contact_radius, self_co
         g_contact.setdiag(0)
         g = g.tocsr().astype(float)
         g_contact = g_contact.tocsr().astype(float)
-        g_contact = dot_product_mkl(g_contact, g)
-        g_contact = dot_product_mkl(g, g_contact)
+        g_contact = g_contact @ g
+        g_contact = g @ g_contact
         g_contact = g_contact.astype(bool).astype(float)
         g_contact.setdiag(0)
         g_contact = pool_edge(g_contact, idx, n)

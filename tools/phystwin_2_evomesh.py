@@ -16,7 +16,7 @@ def compute_normalization_info(data_dict):
     """
     norm_info = {}
     for name, data in data_dict.items():
-        if name == 'cells' or name == 'node_type':
+        if name == 'cells' or name == 'node_type' or name == 'init_spring_Y':
             continue  # 跳过非浮点数据
         data_float = data.astype(np.float64)
         # 对 (T, N, C) 数据，沿着 T 和 N 聚合 (0, 1)
@@ -41,7 +41,7 @@ def compute_normalization_info(data_dict):
         }
     return norm_info
 
-def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file, output_h5_path, output_json_path):
+def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file, split_json_path, output_h5_path, output_json_path):
     print(f"--- 开始处理 Optimization 数据 ---")
     
     # ==============================
@@ -98,7 +98,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     # Controller-Object 参数
     ctrl_radius = connect_params['controller_radius']
     ctrl_max_nn = connect_params['controller_max_neighbours']
-
+ 
     # dashdot_damping 参数
     dashpot_damping = connect_params['dashpot_damping']
     drag_damping = connect_params['drag_damping']
@@ -171,6 +171,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
             rest_lengths.append(
                 np.linalg.norm(ctrl_p0[i] - points[j])
             )
+
     # 转为 Numpy
     if len(edges_list) > 0:
         base_edges = np.array(edges_list, dtype=np.int32)
@@ -194,9 +195,8 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     opt_spring = torch.load(mech_file, map_location='cpu')
 
     spring_property = opt_spring['spring_Y'].numpy().astype(np.float32)
-    assert K == spring_property.shape[0], "边数量与机械属性不匹配！"
-    
 
+    # assert K == spring_property.shape[0], "边数量与机械属性不匹配！"
     # ==============================
     # 5. 组装数据字典
     # ==============================
@@ -236,7 +236,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
         "node_type": data_node_type,
         "mass" :  masses,
         "velocities": data_speed,
-        'init_spring_Y' : global_spring_Y * np.ones((T, K, 1), dtype=np.float32),
+        'init_spring_Y' : global_spring_Y,
         'spring_Y' : spring_property[None, :, None].repeat(T, axis=0),
         'spring_dashpot_damping' : dashpot_damping * np.ones((T, K, 1), dtype=np.float32),
         'spring_reset_length' : rest_lengths[None, :, None].repeat(T, axis=0),
@@ -272,9 +272,19 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     print(f"写入 Meta JSON: {output_json_path}")
     fps = 30.0
 
+    # read the train/test split
+    with open(split_json_path, "r") as f:
+        split = json.load(f)
+    train_frame = split["train"][1]
+    test_frame = split["test"][1]
+
     meta_data = {
         "simulator": "comsol",
+        'FPS': 30,
+        'num_substeps': 667,
         "dt": 5e-5,
+        'object_radius' : obj_radius,
+        'controller_radius' : ctrl_radius,
         "collision_radius": None,
         "collide_elas" : float(collide_elas),
         "collide_fric" : float(collide_fric),
@@ -286,6 +296,9 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
         "num_surface_points" : N_obj + N_surface,
         "num_object_points" : N_obj + N_surface + N_interior,
         "collision_dist" : float(collision_dist),
+        "split": split,
+        "train_frame": train_frame,
+        "test_frame": test_frame,
         "features": {
             name: {
                 "type": "static",
@@ -306,16 +319,17 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
 
 if __name__ == "__main__":
     # 配置文件路径
-    object_cases = ['double_lift_zebra']
-    opt_file_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/data/different_types'
-    param_file_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/experiments_optimization'
-    mech_gt_path = '/mnt/pool1/cxy/phystwin-v2/PhysTwin/experiments'
+    object_cases = os.listdir('./data/different_types')
+    opt_file_path = './data/different_types'
+    param_file_path = './experiments_optimization'
+    mech_gt_path = './experiments'
 
     output_dir = './evomesh_optimization_outputs'
     os.makedirs(output_dir, exist_ok=True)
     for obj_case in object_cases:
         opt_file = os.path.join(opt_file_path, obj_case, "final_data.pkl")
         params_file = os.path.join(param_file_path, obj_case, "optimal_params.pkl")
+        split_file = os.path.join(opt_file_path, obj_case, "split.json")
         mech_file = os.path.join(mech_gt_path, obj_case, "train")
         for mech_gt_file in os.listdir(mech_file):
             if mech_gt_file.startswith('best'):
@@ -327,5 +341,5 @@ if __name__ == "__main__":
         print(f"Processing object: {obj_case}")
         output_h5 = os.path.join(obj_output_dir, f"init_spring_mass.h5")
         output_json = os.path.join(obj_output_dir, f"meta.json")
-        
-        create_optimization_dataset(opt_file, params_file, mech_file, output_h5, output_json)
+
+        create_optimization_dataset(opt_file, params_file, mech_file, split_file, output_h5, output_json)

@@ -409,10 +409,15 @@ class NSFTrainer:
             if torch.isnan(grad_spring_Y).any():
                 break
 
+            # gradient Clip
+            max_grad_norm = 10.0  # 可以根据需要调整这个阈值
+            grad_norm = torch.norm(grad_spring_Y)
+            if grad_norm > max_grad_norm:
+                grad_spring_Y = grad_spring_Y * (max_grad_norm / grad_norm)
+
             losses.append(loss.item())
 
-            # grad_spring_Y clip
-            grad_spring_Y = torch.clamp(grad_spring_Y, min=-1000.0, max=1000.0)            
+            # grad_spring_Y clip          
             grad_spring_Y_sequence.append(grad_spring_Y)
 
             if cfg.use_graph:
