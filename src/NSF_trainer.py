@@ -101,7 +101,7 @@ class NSFTrainer:
         else:
             warp_params_list = []
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr * np.sqrt(self.mdata.train_frame), betas=(0.9, 0.99))
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr * min(np.sqrt(self.mdata.train_frame)-1, 5), betas=(0.9, 0.99))
 
         self.collide_optimizer = torch.optim.Adam(warp_params_list, 
                                           lr=self.args.lr, 
@@ -195,8 +195,8 @@ class NSFTrainer:
         if mech_info is not None:
             logger.info("Setting predicted mechanical properties to simulator")
             if mech_info.dim() == 2:
-                predicted_spring_Y = mech_info[:, 0]
-                predicted_rest_length = mech_info[:, 1]
+                predicted_spring_Y = torch.log(mech_info[0])
+                predicted_rest_length = mech_info[1]
                 wp_predicted_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32, requires_grad=False)
                 simulator.set_spring_Y(wp_predicted_spring_Y)
             else:
@@ -220,44 +220,44 @@ class NSFTrainer:
         chamfer_losses = [0]
         track_losses = [0]
 
-        with wp.ScopedTimer("simulate"):
-            for i in tqdm(range(1, frame_len), desc="Saving trajectory"):
+
+        for i in tqdm(range(1, frame_len), desc="Saving trajectory"):
+            if cfg.data_type == "real":
+                simulator.set_controller_target(i, pure_inference=False)
+            if simulator.object_collision_flag:
+                simulator.update_collision_graph()
+
+            if cfg.use_graph:
+                wp.capture_launch(simulator.forward_graph)
+            else:
+                simulator.step()
+
+            # Compute loss if requested
+            if compute_loss:
                 if cfg.data_type == "real":
-                    simulator.set_controller_target(i, pure_inference=False)
-                if simulator.object_collision_flag:
-                    simulator.update_collision_graph()
-
-                if cfg.use_graph:
-                    wp.capture_launch(simulator.forward_graph)
+                    simulator.calculate_loss()
+                    chamfer_loss = wp.to_torch(simulator.chamfer_loss, requires_grad=False).item()
+                    track_loss = wp.to_torch(simulator.track_loss, requires_grad=False).item()
+                    chamfer_losses.append(chamfer_loss)
+                    track_losses.append(track_loss)
                 else:
-                    simulator.step()
+                    simulator.calculate_simple_loss()
+                    chamfer_losses.append(0.0)
+                    track_losses.append(0.0)
 
-                # Compute loss if requested
-                if compute_loss:
-                    if cfg.data_type == "real":
-                        simulator.calculate_loss()
-                        chamfer_loss = wp.to_torch(simulator.chamfer_loss, requires_grad=False).item()
-                        track_loss = wp.to_torch(simulator.track_loss, requires_grad=False).item()
-                        chamfer_losses.append(chamfer_loss)
-                        track_losses.append(track_loss)
-                    else:
-                        simulator.calculate_simple_loss()
-                        chamfer_losses.append(0.0)
-                        track_losses.append(0.0)
+                frame_loss = wp.to_torch(simulator.loss, requires_grad=False).item()
+                frame_losses.append(frame_loss)
+                simulator.clear_loss()
 
-                    frame_loss = wp.to_torch(simulator.loss, requires_grad=False).item()
-                    frame_losses.append(frame_loss)
-                    simulator.clear_loss()
-
-                x = wp.to_torch(simulator.wp_states[-1].wp_x, requires_grad=False)
-                v = wp.to_torch(simulator.wp_states[-1].wp_v, requires_grad=False)
-                vertices.append(x.cpu())
-                velocities.append(v.cpu())
-                # Set the intial state for the next step
-                simulator.set_init_state(
-                    simulator.wp_states[-1].wp_x,
-                    simulator.wp_states[-1].wp_v,
-                )
+            x = wp.to_torch(simulator.wp_states[-1].wp_x, requires_grad=False)
+            v = wp.to_torch(simulator.wp_states[-1].wp_v, requires_grad=False)
+            vertices.append(x.cpu())
+            velocities.append(v.cpu())
+            # Set the intial state for the next step
+            simulator.set_init_state(
+                simulator.wp_states[-1].wp_x,
+                simulator.wp_states[-1].wp_v,
+            )
 
         vertices = torch.stack(vertices, dim=0)
         velocities = torch.stack(velocities, dim=0)
@@ -461,8 +461,6 @@ class NSFTrainer:
     def run_epoch(self, epoch, 
                   mode='train', 
                   ):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
-
         self.model.module.simulator.set_init_state(
             self.model.module.simulator.wp_init_vertices, 
             self.model.module.simulator.wp_init_velocities
@@ -680,15 +678,14 @@ class NSFTrainer:
         # Save initial trajectory before training
         initial_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'initial_trajectory.pkl')
         logger.info("Saving initial trajectory before training with loss computation")
-        frame_losses, chamfer_losses, track_losses, save_data\
+        frame_losses, chamfer_losses, _, _\
             = self.save_traj(mech_info=None, save_path=initial_traj_save_path, compute_loss=True)
         
-        best_loss = np.mean(frame_losses[:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
+        best_loss = np.sum(frame_losses[1:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
 
         # get initial mech_info from zero-grad optimization results
         spring_rest_length = torch.FloatTensor(self.mdata.spring_rest_length).to(self.device)
         init_spring_Y = torch.log(torch.ones_like(spring_rest_length) * self.mdata.init_spring_Y)
-        default_mech = torch.stack([init_spring_Y, spring_rest_length], dim=1)
 
         for epoch in self.pbar:
             mean_loss_train, mech_info = self.run_epoch(epoch, 
@@ -715,7 +712,11 @@ class NSFTrainer:
                     # save trajectory with current mech_info
                     traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', f'epoch_{epoch}_trajectory.pkl')
                     logger.info(f"Saving trajectory for epoch {epoch}")
-                    self.save_traj(mech_info=mech_info.clone(), save_path=traj_save_path)
+
+                    cur_frame_losses, chamfer_losses, _, _\
+                        = self.save_traj(mech_info=mech_info.clone(), save_path=traj_save_path, compute_loss=True)
+                    
+                    mean_loss_train = np.sum(cur_frame_losses[1:self.mdata.train_frame])  # Initialize best_loss with the initial trajectory loss
    
                     # Check for loss improvement
                     if best_loss > mean_loss_train :
