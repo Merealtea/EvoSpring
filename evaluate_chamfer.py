@@ -7,7 +7,8 @@ import numpy as np
 import os
 from pytorch3d.loss import chamfer_distance
 
-prediction_dir = "./res/springmass/"
+method_case_name = 'End2End' # 'neural_spring_field'  # 'evospring' # 'End2End'
+prediction_dir = f"./res/{method_case_name}/"
 base_path = "./data/different_types/"
 output_file = "results/final_results.csv"
 

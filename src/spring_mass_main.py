@@ -5,7 +5,7 @@ import os
 from enum import Enum
 import random
 import numpy as np
-
+from qqtt.utils import logger, cfg
 
 class MODE(Enum):
     Train = 0
@@ -35,10 +35,10 @@ def getargs():
     parser.add_argument('-multi_mesh_layer', type=int, default=7, help='how many extra layer (in depth)?')
     parser.add_argument('-pre_layer_num', type=int, default=3, help='how many predefined layer ?')
     parser.add_argument('-bottom_layer_num', type=int, default=1, help='how many bottom layer ?')
-    parser.add_argument('-enhance', type=bool, default=True, help='edge enhancement?')
+    parser.add_argument('--enhance', action='store_true', help='edge enhancement?')
     parser.add_argument('-agg_conv_pos', type=bool, default=False, help='aggregate conv position?')
     parser.add_argument('-mp_time', type=int, default=1, help='how many time of MP')
-    parser.add_argument('-hidden_dim', type=int, default=128, help='hidden dim of MLP')
+    parser.add_argument('-hidden_dim', type=int, default=128, help='hidden dim of MLP') # DEBUG
     parser.add_argument('-hidden_depth', type=int, default=2, help='hidden depth of MLP')
     parser.add_argument('-particle_radius', type=float, default=0.025, help='The particle radius of CConv')
 
@@ -82,6 +82,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda", args.local_rank)
     print("device", device)
+
     if args.case == 'spring_mass':
         trainer = SpringMassTrainer(args, device)
     elif args.case == 'neural_spring_field':
@@ -90,6 +91,9 @@ if __name__ == "__main__":
     elif args.case == 'evospring':
         from EvoSpring_trainer import EvoSpringTrainer
         trainer = EvoSpringTrainer(args, device)
+    elif args.case == 'End2End':
+        from End2End_trainer import E2ETrainer
+        trainer = E2ETrainer(args, device)
     
     if MODE(args.mode) == MODE.Train:
         print('Train')

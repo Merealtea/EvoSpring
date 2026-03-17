@@ -74,7 +74,7 @@ class RealData:
 
         self.frame_len = self.object_points.shape[0]
         # Visualize/save the GT frames
-        self.visualize_data(visualize=visualize, save_gt=save_gt)
+        # self.visualize_data(visualize=visualize, save_gt=save_gt)
 
     def visualize_data(self, visualize=False, save_gt=True):
         if visualize:

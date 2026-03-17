@@ -88,7 +88,7 @@ def eval_springs(
     springs: wp.array(dtype=wp.vec2i),
     rest_lengths: wp.array(dtype=float),
     spring_Y: wp.array(dtype=float),
-    dashpot_damping: float,
+    dashpot_damping: wp.array(dtype=float),
     spring_Y_min: float,
     spring_Y_max: float,
     f: wp.array(dtype=wp.vec3),
@@ -127,7 +127,7 @@ def eval_springs(
         )
 
         v_rel = wp.dot(v2 - v1, d)
-        dashpot_forces = dashpot_damping * v_rel * d
+        dashpot_forces = dashpot_damping[0] * v_rel * d
 
         overall_force = spring_force + dashpot_forces
 
@@ -143,7 +143,7 @@ def update_vel_from_force(
     f: wp.array(dtype=wp.vec3),
     masses: wp.array(dtype=wp.float32),
     dt: float,
-    drag_damping: float,
+    drag_damping: wp.array(dtype=float),
     reverse_factor: float,
     v_new: wp.array(dtype=wp.vec3),
 ):
@@ -153,7 +153,7 @@ def update_vel_from_force(
     f0 = f[tid]
     m0 = masses[tid]
 
-    drag_damping_factor = wp.exp(-dt * drag_damping)
+    drag_damping_factor = wp.exp(-dt * drag_damping[0])
     all_force = f0 + m0 * wp.vec3(0.0, 0.0, -9.8) * reverse_factor
     a = all_force / m0
     v1 = v0 + a * dt
@@ -622,8 +622,15 @@ class SpringMassSystemWarp:
 
         self.dt = dt
         self.num_substeps = num_substeps
-        self.dashpot_damping = dashpot_damping
-        self.drag_damping = drag_damping
+        self.wp_dashpot_damping = wp.from_torch(
+            torch.tensor([dashpot_damping], dtype=torch.float32, device=self.device),
+            requires_grad=True,
+        )
+        self.wp_drag_damping = wp.from_torch(
+            torch.tensor([drag_damping], dtype=torch.float32, device=self.device),
+            requires_grad=True,
+        )
+
         self.reverse_factor = 1.0 if not reverse_z else -1.0
         self.spring_Y_min = spring_Y_min
         self.spring_Y_max = spring_Y_max
@@ -1018,7 +1025,7 @@ class SpringMassSystemWarp:
                     self.wp_springs,
                     self.wp_rest_lengths,
                     self.wp_spring_Y,
-                    self.dashpot_damping,
+                    self.wp_dashpot_damping,
                     self.spring_Y_min,
                     self.spring_Y_max,
                 ],
@@ -1039,7 +1046,7 @@ class SpringMassSystemWarp:
                     self.wp_states[i].wp_vertice_forces,
                     self.wp_masses,
                     self.dt,
-                    self.drag_damping,
+                    self.wp_drag_damping,
                     self.reverse_factor,
                 ],
                 outputs=[output_v],
@@ -1179,6 +1186,25 @@ class SpringMassSystemWarp:
             dim=self.n_springs,
             inputs=[spring_Y],
             outputs=[self.wp_spring_Y],
+        )
+
+    def set_drag_damping(self, drag_damping):
+        """Set drag damping parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[drag_damping],
+            outputs=[self.wp_drag_damping],
+        )
+
+
+    def set_dashpot_damping(self, dashpot_damping):
+        """Set dashpot damping parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[dashpot_damping],
+            outputs=[self.wp_dashpot_damping],
         )
 
     def set_collide(self, collide_elas, collide_fric):

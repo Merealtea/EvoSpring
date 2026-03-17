@@ -5,7 +5,8 @@ import json
 import numpy as np
 from scipy.spatial import KDTree
 
-prediction_path = "./res/springmass/"
+method_case_name = 'End2End' # 'neural_spring_field'  # 'evospring' # 'End2End'
+prediction_path = f"./res/{method_case_name}/"
 base_path = "./data/different_types/"
 output_file = "results/final_track.csv"
 

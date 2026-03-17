@@ -100,7 +100,7 @@ def bstride_selection(flat_edge, seed_heuristic, pos_mesh=None, n=None):
     adj_list = _flat_edge_to_adj_list(flat_edge, n=n)
     adj_mat = _flat_edge_to_adj_mat(flat_edge, n=n)
     # adj mat enhance the diag
-    adj_mat.setdiag(1)
+    # adj_mat.setdiag(1) # debug : no diagnal here
     # 0. compute clusters, each of which should be deivded independantly
     clusters = _find_clusters(adj_list)
     # 1. seeding: by BFS_all for small graphs, or by seed_heuristic for larger graphs
@@ -154,9 +154,9 @@ def bstride_selection(flat_edge, seed_heuristic, pos_mesh=None, n=None):
     adj_mat = adj_mat.tocsr().astype(float)
 
 
-    # double hop
-    adj_mat = adj_mat @ adj_mat
-    adj_mat.setdiag(0)
+    # double hop (DEBUG: remove double hop)
+    # adj_mat = adj_mat @ adj_mat
+    # adj_mat.setdiag(0)
 
     adj_mat = pool_edge(adj_mat, combined_idx_kept, n)
     return combined_idx_kept, adj_mat

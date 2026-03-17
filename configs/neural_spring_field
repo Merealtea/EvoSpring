@@ -12,4 +12,4 @@ batch=1
 lr=1e-3
 gamma=0.9
 data_dir='./evomesh_optimization_outputs'
-dump_dir='./res/nsf/'
+dump_dir='./res/neural_spring_field/'

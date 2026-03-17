@@ -13,8 +13,61 @@ from torch_geometric.utils import (
     coalesce,
 )
 from core_model import EvoMesh, WeightedEdgeConv, Unpool
+import torch.nn.functional as F
+import math
 
-class evospring_amp(MessagePassing):
+import torch
+import torch.nn as nn
+
+class PosAwareTransformerLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super().__init__()
+        # 使用 PyTorch 原生的 MultiheadAttention，开启 batch_first=True
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, src, pos_enc, attn_mask=None):
+        # 核心：将 pos_enc 加到 query 和 key 上，value 保持原本的特征 src
+        q = src + pos_enc
+        k = src + pos_enc
+        v = src
+        
+        # need_weights=False 可以进一步避免存储 Attention Weight 矩阵，节省显存
+        src2 = self.self_attn(q, k, v, attn_mask=attn_mask, need_weights=False)[0]
+        
+        # 残差连接与 LayerNorm
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        # FFN 网络
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+class PosAwareTransformerEncoder(nn.Module):
+    def __init__(self, num_layers, d_model, nhead, dim_feedforward, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            PosAwareTransformerLayer(d_model, nhead, dim_feedforward, dropout) 
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, src, pos_enc, attn_mask=None):
+        for layer in self.layers:
+            src = layer(src, pos_enc, attn_mask)
+        return src
+
+class End2End_amp(MessagePassing):
     def __init__(self, latent_dim, hidden_layer, pos_dim, lagrangian):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp_node_delta = MLP(2 * latent_dim, latent_dim, latent_dim, hidden_layer, True)
@@ -90,7 +143,7 @@ class evospring_amp(MessagePassing):
 
         return self.mlp_node_delta(tmp) + x, edge_weight, y_hard
     
-class evospring_amp_base(MessagePassing):
+class End2End_amp_base(MessagePassing):
     def __init__(self, latent_dim, hidden_layer, pos_dim, lagrangian):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp_node_delta = MLP(2 * latent_dim, latent_dim, latent_dim, hidden_layer, True)
@@ -149,7 +202,7 @@ class evospring_amp_base(MessagePassing):
         tmp = torch.cat([x, aggr_out], dim=-1)
         return self.mlp_node_delta(tmp) + x, edge_weight, edge_embedding
 
-class EvoSpring(EvoMesh):
+class End2End(EvoMesh):
     def __init__(self, l_n, pre_l_n, bottom_ln, ld, hidden_layer, pos_dim, lagrangian, enhance=True, agg_conv_pos=False, edge_set_num=1):
         super(EvoMesh, self).__init__()
         self.down_gmps = nn.ModuleList()
@@ -161,16 +214,38 @@ class EvoSpring(EvoMesh):
         self.enhance = enhance
         self.agg_conv_pos = agg_conv_pos
         self.bottom_ln = bottom_ln
-        self.bottom_gmp = nn.ModuleList(evospring_amp_base(ld, hidden_layer, pos_dim, lagrangian) for _ in range(self.bottom_ln))
+        self.bottom_gmp = nn.ModuleList(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian) for _ in range(self.bottom_ln))
         for _ in range(self.l_n):
             if _ < self.pre_l_n:
-                self.down_gmps.append(evospring_amp_base(ld, hidden_layer, pos_dim, lagrangian))
+                self.down_gmps.append(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian))
             else:
-                self.down_gmps.append(evospring_amp(ld, hidden_layer, pos_dim, lagrangian))
-            self.up_gmps.append(evospring_amp_base(ld, hidden_layer, pos_dim, lagrangian))
+                self.down_gmps.append(End2End_amp(ld, hidden_layer, pos_dim, lagrangian))
+            self.up_gmps.append(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian))
             self.unpools.append(Unpool())
         self.esn = edge_set_num
         self.lagrangian = lagrangian
+
+        # Transformer components for attention map calculation
+        self.attn_nhead = 8
+        self.ld = ld
+        self.pos_dim = pos_dim
+
+        # Position encoding generator
+        self.pos_encoder = nn.Linear(pos_dim, ld)
+
+        # ---------------- 修改开始 ----------------
+        # 移除原有的 nn.TransformerEncoderLayer 和 nn.TransformerEncoder
+        # 替换为支持显式传入 pos_enc 的自定义 Encoder
+        self.transformer_encoder = PosAwareTransformerEncoder(
+            num_layers=3,
+            d_model=ld,
+            nhead=self.attn_nhead,  # <--- 将 num_heads 改为 nhead
+            dim_feedforward=ld * 4,
+            dropout=0.1
+        )
+        # ---------------- 修改结束 ----------------
+
+        self.edge_weight = MLP(2*ld, ld, ld, hidden_layer, True)
 
     def pool_edge(self, g, idx, num_nodes, num_orignal_edge):
         idx = idx.to(torch.long)
@@ -192,7 +267,7 @@ class EvoSpring(EvoMesh):
         new_edge_parent[:len(original_valid)] = torch.arange(num_orignal_edge, dtype=torch.long, device=g.device).unsqueeze(-1)[original_valid]
         return new_g, new_edge_parent
 
-    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, temp=0.1, weights=None):
+    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, temp=0.1, attn_mask=None):
         # node_in is in shape of (T), N, F
         # if edge_set_num>1, then m_g is in shape: Level,(Set),2,Edges, the 0th Set is main/material graph
         # pos is in (T),N,D
@@ -218,6 +293,7 @@ class EvoSpring(EvoMesh):
         # down pass
         l_n = self.l_n 
         num_nodes_list = []
+        ds_edge_embedding = []
         for i in range(l_n):
             num_nodes = node_in.shape[-2] if i == 0 else len(m_ids[i-1]) #.shape[0]
             num_nodes_list.append(num_nodes)
@@ -234,10 +310,11 @@ class EvoSpring(EvoMesh):
             multi_level_edge_mech_info.append(edge_mech_in)
 
             if i < self.pre_l_n:
-                node_in, ew, _ = self.down_gmps[i](node_in, edge_mech_in, gs, pos)
+                node_in, ew, edge_embedding = self.down_gmps[i](node_in, edge_mech_in, gs, pos)
                 if i == 0 and self.lagrangian:
                     node_in, ew = self.down_gmps[i](node_in, edge_mech_in, gs, pos)
                 y_hard = None
+                ds_edge_embedding.append(edge_embedding)
             else:
                 # deeper downsample
                 # dowmsample more to make the network more compact
@@ -341,6 +418,39 @@ class EvoSpring(EvoMesh):
             # if up_idx == 0 and self.lagrangian:
             #     node_in, ew_u = self.up_gmps[i](node_in, edge_mech_in, g, down_ps[up_idx])
             node_in = node_in + down_outs[up_idx]
-            
+
+        edge_embedding = edge_embedding + ds_edge_embedding[0]
+        # add transformer layer for node_in
+        # node_in shape: (T, N, latent_dim)
+        T, N, _ = node_in.shape
+
+        # 1. 提取当前尺度的 pos 并生成 Positional Encoding
+        current_pos = down_ps[0].squeeze(0) if down_ps[0].dim() == 4 else down_ps[0] 
+        pos_enc = self.pos_encoder(current_pos) # shape: (T, N, ld)
+
+        # 2. 显存优化的 Mask 处理：不使用 repeat，直接利用广播机制
+        non_connection_node = torch.where(attn_mask.sum(dim=0) == attn_mask.shape[0])[0]
+        attn_mask[non_connection_node, non_connection_node] = False
+        
+        # PyTorch 原生 MHA 需要 Float 格式的 Mask: 0.0 表示保留计算，-inf 表示断开连接
+        float_mask = torch.zeros_like(attn_mask, dtype=torch.float)
+        float_mask[~attn_mask] = float('-inf')
+
+        # 3. 传入重构后的 Transformer (自动将 pos_enc 分配给 Q 和 K)
+        # 注意这里不再需要繁琐的 permute，因为上面我们在类内部已经开启了 batch_first=True
+        node_in_transformed = self.transformer_encoder(node_in, pos_enc, attn_mask=float_mask)
+        
+        node_in = node_in_transformed + node_in  # residual connection
+        src_idx, tgt_idx = m_gs[0]
+        src_node = node_in[:, src_idx]
+        tgt_node = node_in[:, tgt_idx]
+
+        edge_weight_feat = self.edge_weight(torch.cat([src_node, tgt_node], dim = -1))
+        num_edge = len(src_idx)
+        
+        # Average symmetric edges
+        edge_feature = edge_embedding[:, :num_edge//2] + edge_embedding[:, num_edge//2:]
+        edge_weight_feat = edge_weight_feat[:, :num_edge//2] + edge_weight_feat[:, num_edge//2:]
+
         # print(num_nodes_list)
-        return node_in, edge_embedding
+        return edge_weight_feat, edge_feature
