@@ -10,7 +10,7 @@ vis_interval: 20
 init_spring_Y: 3e4
 collide_elas: 0.5
 collide_fric: 0.3
-collide_object_elas: 0.7
+collide_object_elas: 0.3
 collide_object_fric: 0.3
 object_radius: 0.02
 object_max_neighbours: 30

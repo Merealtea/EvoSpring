@@ -1,13 +1,14 @@
 import torch
+import numpy as np
 from qqtt.utils import logger, cfg
 import warp as wp
 
-wp.init()
-wp.set_device("cuda:0")
-if not cfg.use_graph:
-    wp.config.mode = "debug"
-    wp.config.verbose = True
-    wp.config.verify_autograd_array_access = True
+# wp.init()
+# wp.set_device("cuda:0")
+# if not cfg.use_graph:
+#     wp.config.mode = "debug"
+#     wp.config.verbose = True
+#     wp.config.verify_autograd_array_access = True
 
 
 class State:
@@ -23,18 +24,15 @@ class State:
         )
         self.wp_control_v = wp.zeros_like(self.wp_control_x, requires_grad=False)
 
+        # --- 新增：用于在 Kernel 中记录碰撞信息的 Buffer ---
+        num_object_points = wp_init_vertices.shape[0]
+        self.wp_hit_count = wp.zeros(num_object_points, dtype=wp.int32, requires_grad=False)
+        self.wp_hit_indices = wp.zeros((num_object_points, 100), dtype=wp.int32, requires_grad=False)
+        self.wp_hit_impulses = wp.zeros((num_object_points, 100), dtype=wp.vec3, requires_grad=False)
+
     def clear_forces(self):
         self.wp_vertice_forces.zero_()
-
-    # This takes more time but not necessary, will be overwritten directly
-    # def clear_control(self):
-    #     self.wp_control_x.zero_()
-    #     self.wp_control_v.zero_()
-
-    # def clear_states(self):
-    #     self.wp_x.zero_()
-    #     self.wp_v_before_ground.zero_()
-    #     self.wp_v.zero_()
+        self.wp_hit_count.zero_()
 
     @property
     def requires_grad(self):
@@ -68,9 +66,7 @@ def set_control_points(
     step: int,
     control_x: wp.array(dtype=wp.vec3),
 ):
-    # Set the control points in each substep
     tid = wp.tid()
-
     t = float(step + 1) / float(num_substeps)
     control_x[tid] = (
         original_control_point[tid]
@@ -174,6 +170,10 @@ def loop(
     collision_dist: float,
     clamp_collide_object_elas: float,
     clamp_collide_object_fric: float,
+    # --- 新增参数 ---
+    hit_count: wp.array(dtype=wp.int32),
+    hit_indices: wp.array2d(dtype=wp.int32),
+    hit_impulses: wp.array2d(dtype=wp.vec3),
 ):
     x1 = x[i]
     v1 = v[i]
@@ -220,8 +220,14 @@ def loop(
             impulse_t = (a - 1.0) * v_rel_t / (1.0 / m1 + 1.0 / m2)
 
             J = impulse_n + impulse_t
-
             J_sum += J
+
+            # --- 新增：在这里直接将真实的碰撞 ID 和冲量写入显存 ---
+            current_hits = hit_count[i]
+            if current_hits < 100:  
+                hit_indices[i, current_hits] = index
+                hit_impulses[i, current_hits] = J
+                hit_count[i] = current_hits + 1
 
     return valid_count, J_sum
 
@@ -268,6 +274,11 @@ def object_collision(
     collision_dist: float,
     collision_indices: wp.array2d(dtype=wp.int32),
     collision_number: wp.array(dtype=wp.int32),
+    # --- 新增参数 ---
+    hit_count: wp.array(dtype=wp.int32),
+    hit_indices: wp.array2d(dtype=wp.int32),
+    hit_impulses: wp.array2d(dtype=wp.vec3),
+    # --------------
     v_new: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
@@ -289,6 +300,9 @@ def object_collision(
         collision_dist,
         clamp_collide_object_elas,
         clamp_collide_object_fric,
+        hit_count,     # 传入
+        hit_indices,   # 传入
+        hit_impulses,  # 传入
     )
 
     if valid_count > 0:
@@ -639,6 +653,7 @@ class SpringMassSystemWarp:
             assert num_object_points == self.n_vertices
         else:
             assert (controller_points.shape[1] + num_object_points) == self.n_vertices
+
         self.num_object_points = num_object_points
         self.num_control_points = (
             controller_points.shape[1] if not controller_points is None else 0
@@ -693,7 +708,9 @@ class SpringMassSystemWarp:
         self.wp_springs = wp.from_torch(
             init_springs, dtype=wp.vec2i, requires_grad=False
         )
-        
+        self.wp_rest_lengths = wp.from_torch(
+            init_rest_lengths, dtype=wp.float32, requires_grad=False
+        )
         self.wp_masses = wp.from_torch(
             init_masses[:num_object_points], dtype=wp.float32, requires_grad=False
         )
@@ -749,11 +766,6 @@ class SpringMassSystemWarp:
             * torch.ones(self.n_springs, dtype=torch.float32, device=self.device),
             requires_grad=True,
         )
-        self.wp_rest_lengths = wp.from_torch(
-            init_rest_lengths, dtype=wp.float32,
-            requires_grad=True,
-        )
-
         self.wp_collide_elas = wp.from_torch(
             torch.tensor([collide_elas], dtype=torch.float32, device=self.device),
             requires_grad=cfg.collision_learn,
@@ -875,52 +887,6 @@ class SpringMassSystemWarp:
             inputs=[controller_interactive],
             outputs=[self.wp_target_control_point],
         )
-
-    def set_mech_info(self, spring_Y, rest_lengths, pure_inference=False):
-        # Convert to warp arrays and set mechanical properties
-
-        assert spring_Y.shape[0] == self.n_springs
-        assert rest_lengths.shape[0] == self.n_springs
-
-        # Convert to warp arrays if they are torch tensors
-        if not isinstance(spring_Y, wp.array):
-            wp_spring_Y = wp.from_torch(spring_Y, dtype=wp.float32, requires_grad=True)
-        else:
-            wp_spring_Y = spring_Y
-
-        if not isinstance(rest_lengths, wp.array):
-            wp_rest_lengths = wp.from_torch(rest_lengths, dtype=wp.float32, requires_grad=False)
-        else:
-            wp_rest_lengths = rest_lengths
-
-        # Copy to member variables
-        if not pure_inference:
-            wp.launch(
-                copy_float,
-                dim=self.n_springs,
-                inputs=[wp.clone(wp_spring_Y, requires_grad=False)],
-                outputs=[self.wp_spring_Y],
-            )
-            wp.launch(
-                copy_float,
-                dim=self.n_springs,
-                inputs=[wp.clone(wp_rest_lengths, requires_grad=False)],
-                outputs=[self.wp_rest_lengths],
-            )
-        else:
-            wp.launch(
-                copy_float,
-                dim=self.n_springs,
-                inputs=[wp_spring_Y],
-                outputs=[self.wp_spring_Y],
-            )
-            wp.launch(
-                copy_float,
-                dim=self.n_springs,
-                inputs=[wp_rest_lengths],
-                outputs=[self.wp_rest_lengths],
-            )
-
 
     def set_init_state(self, wp_x, wp_v, pure_inference=False):
         # Detach and clone and set requires_grad=True
@@ -1067,6 +1033,10 @@ class SpringMassSystemWarp:
                         self.collision_dist,
                         self.wp_collision_indices,
                         self.wp_collision_number,
+                        # --- 传入当前状态记录器 ---
+                        self.wp_states[i].wp_hit_count,
+                        self.wp_states[i].wp_hit_indices,
+                        self.wp_states[i].wp_hit_impulses,
                     ],
                     outputs=[self.wp_states[i].wp_v_before_ground],
                 )
@@ -1085,7 +1055,6 @@ class SpringMassSystemWarp:
                 ],
                 outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
             )
-  
 
     def calculate_loss(self):
         # Compute the chamfer loss
@@ -1197,7 +1166,6 @@ class SpringMassSystemWarp:
             outputs=[self.wp_drag_damping],
         )
 
-
     def set_dashpot_damping(self, dashpot_damping):
         """Set dashpot damping parameter from Warp array"""
         wp.launch(
@@ -1221,6 +1189,24 @@ class SpringMassSystemWarp:
             outputs=[self.wp_collide_fric],
         )
 
+    def set_collision_elas(self, collide_elas):
+        """Set collision elasticity parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[collide_elas],
+            outputs=[self.wp_collide_elas],
+        )
+
+    def set_collision_fric(self, collide_fric):
+        """Set collision friction parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[collide_fric],
+            outputs=[self.wp_collide_fric],
+        )
+
     def set_collide_object(self, collide_object_elas, collide_object_fric):
         wp.launch(
             copy_float,
@@ -1235,11 +1221,76 @@ class SpringMassSystemWarp:
             outputs=[self.wp_collide_object_fric],
         )
 
-    def get_node_predict(self):
-        """
-        Get the predicted node positions after the simulation step.
+    def set_collision_object_elas(self, collide_object_elas):
+        """Set object collision elasticity parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[collide_object_elas],
+            outputs=[self.wp_collide_object_elas],
+        )
 
-        Returns:
-            torch.Tensor: Predicted node positions of shape (num_object_points, 3)
+    def set_collision_object_fric(self, collide_object_fric):
+        """Set object collision friction parameter from Warp array"""
+        wp.launch(
+            copy_float,
+            dim=1,
+            inputs=[collide_object_fric],
+            outputs=[self.wp_collide_object_fric],
+        )
+
+    def export_forces_to_txt(self, frame_idx, filename="particle_exact_collision_log.txt", max_points=100):
         """
-        return wp.to_torch(self.wp_states[-1].wp_x)
+        导出碰撞日志（基于 Kernel 内的精准记录）。
+        """
+        if not self.object_collision_flag:
+            return
+
+        # 确保 GPU 执行完成
+        # wp.synchronize_device(self.device)
+        
+        masses = self.wp_masses.numpy()
+        masks = self.wp_masks.numpy()
+        record_limit = min(self.num_object_points, max_points)
+
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(f"========== Frame {frame_idx} ==========\n")
+
+            for i in range(self.num_substeps):
+                substep_has_collision = False
+                if i > 95 and i < 100:
+                    # 直接拉取 Kernel 里记录的精准碰撞数据
+                    hit_count = self.wp_states[i].wp_hit_count.numpy()
+                    hit_indices = self.wp_states[i].wp_hit_indices.numpy()
+                    hit_impulses = self.wp_states[i].wp_hit_impulses.numpy()
+                    pos = self.wp_states[i].wp_x.numpy()
+
+                    substep_logs = []
+
+                    for p in range(record_limit):
+                        count = hit_count[p]
+                        if count > 0:
+                            substep_has_collision = True
+                            p_pos = pos[p]
+                            p_mask = masks[p]
+                            m1 = masses[p]
+
+                            for k in range(count):
+                                target_id = hit_indices[p, k]
+                                # Kernel 里算的是冲量 J，根据 F = J / (m * dt) 还原出真实的力
+                                # 注意：v_new = v - (J_avg / m), 物理学上冲量作用在当前粒子上的效果是 -J / (m * dt)
+                                J = hit_impulses[p, k]
+                                force = -J / (m1 * self.dt)
+                                force_mag = np.linalg.norm(force)
+
+                                log_str = (f"    Particle {p:04d} [Mask:{p_mask}] "
+                                        f"Hit -> Particle {target_id:04d} | "
+                                        f"Pos: ({p_pos[0]:6.3f}, {p_pos[1]:6.3f}, {p_pos[2]:6.3f}) | "
+                                        f"Force applied: ({force[0]:8.4f}, {force[1]:8.4f}, {force[2]:8.4f}) | "
+                                        f"Mag: {force_mag:8.4f}\n")
+                                substep_logs.append(log_str)
+                
+                if substep_has_collision:
+                    f.write(f"  --- Substep {i} ---\n")
+                    f.writelines(substep_logs)
+            f.write("\n")

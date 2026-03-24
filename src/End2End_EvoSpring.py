@@ -1,5 +1,6 @@
 from models import ModelGeneral
 import torch
+from torch_geometric.utils import degree
 from End2End_core_model import End2End
 from core_model import MLP, gumbel_softmax
 from qqtt.model.diff_simulator import (
@@ -32,11 +33,11 @@ class FourierFeatureTransform(torch.nn.Module):
         return torch.cat(out, dim=-1)
 
 class End2End_EvoSpring(ModelGeneral):
-    def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos, default_spring_Y, default_drag_damping=None, default_dashpot_damping=None):
+    def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos, default_spring_Y, default_drag_damping=None, default_dashpot_damping=None, default_collision_elas=None, default_collision_fric=None, default_collision_object_elas=None, default_collision_object_fric=None):
         # in: d_x(used for driven nodes only),type
         # out: d_x
         in_dim = 60 # init_pos, node_mass, node_damping, node_type, pos_encoding
-        out_dim = pos_dim
+  
         self.lagrangian = False
         super(ModelGeneral, self).__init__()
         edge_set_num = 1
@@ -67,9 +68,21 @@ class End2End_EvoSpring(ModelGeneral):
         self.drag_damping_0 = float(default_drag_damping) if default_drag_damping is not None else 0.5
         self.dashpot_damping_0 = float(default_dashpot_damping) if default_dashpot_damping is not None else 0.5
 
+        # Store default collision values
+        self.collision_elas_0 = float(default_collision_elas) if default_collision_elas is not None else 0.5
+        self.collision_fric_0 = float(default_collision_fric) if default_collision_fric is not None else 0.5
+        self.collision_object_elas_0 = float(default_collision_object_elas) if default_collision_object_elas is not None else 0.7
+        self.collision_object_fric_0 = float(default_collision_object_fric) if default_collision_object_fric is not None else 0.3
+
         # Learnable damping bias parameters (initialized to 0)
         self.drag_damping_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
         self.dashpot_damping_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
+
+        # Learnable collision bias parameters (initialized to 0)
+        self.collision_elas_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
+        self.collision_fric_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
+        self.collision_object_elas_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
+        self.collision_object_fric_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
 
     def load_warp_simulator(self, simulator):
         self.simulator = simulator
@@ -118,8 +131,6 @@ class End2End_EvoSpring(ModelGeneral):
         return node_info[..., 2*self.pos_dim: 3*self.pos_dim].clone()
 
     def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, node_type, attn_mask=None):
-
-
         node_feature = self._get_nodal_latent_input(node_feature)
 
         # TODO: Generate edge features for spring-mass system if needed
@@ -128,10 +139,56 @@ class End2End_EvoSpring(ModelGeneral):
         # Add node type embeddings
         type_emb = self.node_type_embedding(node_type.long())
         x = x + type_emb
-        edge_weight, edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, self.temp, attn_mask)
+        edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, self.temp, attn_mask)
 
-        return edge_weight, edge_feature
+        return edge_feature
+    
+    def _enforce_min_degree(self, m_gs, edge_mask, num_nodes):
+        """
+        Fast, parallelized constraint enforcement to ensure node degree >= min(2, original_degree).
+        Runs entirely on GPU using vectorized operations.
+        """
+        device = edge_mask.device
         
+        # Handle potential batch dimensions in m_idx (assuming shape [2, E] or [1, 2, E])
+        src = m_gs[0][0][:edge_mask.shape[0]]
+        
+        # 1. Calculate target minimum degree based on original graph connections
+        orig_degree = degree(src, num_nodes=num_nodes, dtype=torch.long)
+        target_degree = torch.clamp(orig_degree, max=2)
+        
+        constrained_mask = edge_mask.long().clone()
+        
+        # 2. Max possible deficit is 2, so we only ever need at most 2 iterations
+        for _ in range(2):
+            # Calculate current degree based on edges currently kept (mask == 1)
+            current_degree = degree(src[constrained_mask == 1], num_nodes=num_nodes, dtype=torch.long)
+            deficit = target_degree - current_degree
+            
+            # Identify nodes that still need more edges
+            deficient_nodes = torch.nonzero(deficit > 0).squeeze(-1)
+            if deficient_nodes.numel() == 0:
+                break # All constraints satisfied!
+                
+            # 3. Find available edges: they must belong to a deficient node AND be currently dropped (0)
+            is_deficient_src = deficit[src] > 0
+            available_edges_mask = is_deficient_src & (constrained_mask == 0)
+            available_edge_indices = torch.nonzero(available_edges_mask).squeeze(-1)
+            
+            if available_edge_indices.numel() == 0:
+                break # No more valid original edges to add
+                
+            # 4. Pick ONE valid edge for each deficient node in parallel
+            # Use scatter_ to place edge indices into a node-sized array.
+            # Multiple edges for the same node will overwrite each other, leaving the last one.
+            selected_edge_per_node = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+            selected_edge_per_node.scatter_(0, src[available_edge_indices], available_edge_indices)
+
+            # 5. Flip the selected random edges back to 1
+            edges_to_add = selected_edge_per_node[selected_edge_per_node != -1]
+            constrained_mask[edges_to_add] = 1
+
+        return constrained_mask
     
     def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, attn_mask=None):
         if self.temp > 0.1 :
@@ -142,29 +199,18 @@ class End2End_EvoSpring(ModelGeneral):
         node_pos, node_type = self._get_pos_type(node_in)
 
         # Process current frame through EMD
-        edge_weight, edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_type, attn_mask)
-
-        # 6. Apply Gumbel-Softmax for edge selection
-        edge_logits = self.edge_selector(edge_weight)  # Shape: [batch, num_edges, 2]
-        edge_probs_soft, edge_probs_hard = gumbel_softmax(edge_logits, self.temp, hard=False)
-        # edge_keep_prob = edge_probs_soft[..., 1:2]  # Probability of keeping the edge, shape: [batch, num_edges, 1]
-
-        # 统计 edge_probs_hard[..., 0] 中为 1 的边的数量和比例
-        edges_with_one = (edge_probs_hard[..., 0] == 1).sum().item()
-        total_edges = edge_probs_hard[..., 0].numel()
-        ratio = edges_with_one / total_edges if total_edges > 0 else 0
-        print(f"Edges with value 1: {edges_with_one}/{total_edges} ({ratio*100:.2f}%)")
+        edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_type, attn_mask)
 
         edge_mech_in_bias = self.edge_decode(edge_feature)[0,:,0]  # Remove time dimension
 
         print("edge bias min is {}, edge bias max is {}".format(edge_mech_in_bias.min(), edge_mech_in_bias.max()))
 
-        s_out = ((self.S_0 + edge_mech_in_bias * 1e2)) * edge_probs_hard[0, :, 0]
-        s_out = torch.clip(s_out, 0, cfg.spring_Y_max)
+        s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
+        s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
 
-        # Return spring stiffness and damping parameters (default + learnable bias)
-        drag_damping_out = self.drag_damping_0 + self.drag_damping_bias * 10
-        dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias * 100
-      
-        return s_out, drag_damping_out, dashpot_damping_out, edge_probs_soft
+        # # Return spring stiffness and damping parameters (default + learnable bias)
+        drag_damping_out = self.drag_damping_0 + self.drag_damping_bias * 100
+        dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias * 1000
+
+        return s_out, drag_damping_out, dashpot_damping_out
     

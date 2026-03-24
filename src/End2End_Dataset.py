@@ -9,6 +9,7 @@ import json
 import pickle
 from qqtt.utils import logger, cfg
 from qqtt.data import RealData, SimpleData
+import sys
 from qqtt.model.diff_simulator import SpringMassSystemWarp
 import open3d as o3d
 
@@ -49,7 +50,7 @@ class End2EndDataset(MeshGeneralDataset):
         test_frame = split["test"][1] - train_frame
 
         if "cloth" in self.object_case or "package" in self.object_case:
-                cfg.load_from_yaml("configs/phystwin_configs/cloth.yaml")
+            cfg.load_from_yaml("configs/phystwin_configs/cloth.yaml")
         else:
             cfg.load_from_yaml("configs/phystwin_configs/real.yaml")
 
@@ -72,12 +73,13 @@ class End2EndDataset(MeshGeneralDataset):
             data = json.load(f)
         cfg.intrinsics = np.array(data["intrinsics"])
         cfg.WH = data["WH"]
+        cfg.overlay_path = f"{opt_file_path}/{self.object_case}/color"
 
         self.init_masks = None
         self.init_velocities = None
         # Load the data
         if cfg.data_type == "real":
-            self.dataset = RealData(visualize=False)
+            self.dataset = RealData(visualize=False, save_gt=False)
             # Get the object points and controller points
             self.object_points = self.dataset.object_points
             self.object_colors = self.dataset.object_colors
@@ -128,10 +130,10 @@ class End2EndDataset(MeshGeneralDataset):
         ) = self._init_start(
             self.structure_points,
             firt_frame_controller_points,
-            object_radius=0.05, # cfg.object_radius,
-            object_max_neighbours= 50, #cfg.object_max_neighbours,
-            controller_radius=0.08, # cfg.controller_radius,
-            controller_max_neighbours=80, #cfg.controller_max_neighbours,
+            object_radius=cfg.object_radius,
+            object_max_neighbours=cfg.object_max_neighbours,
+            controller_radius=cfg.controller_radius,
+            controller_max_neighbours=cfg.controller_max_neighbours,
             mask=self.init_masks,
         )
 

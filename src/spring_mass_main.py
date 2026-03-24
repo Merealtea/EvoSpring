@@ -6,6 +6,7 @@ from enum import Enum
 import random
 import numpy as np
 from qqtt.utils import logger, cfg
+import warp as wp
 
 class MODE(Enum):
     Train = 0
@@ -81,6 +82,13 @@ if __name__ == "__main__":
     torch.distributed.barrier()
 
     device = torch.device("cuda", args.local_rank)
+
+    wp.init()
+    wp.set_device("cuda:0")
+    if not cfg.use_graph:
+        wp.config.mode = "debug"
+        wp.config.verbose = True
+        wp.config.verify_autograd_array_access = True
     print("device", device)
 
     if args.case == 'spring_mass':

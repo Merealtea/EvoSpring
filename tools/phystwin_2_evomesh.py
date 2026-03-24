@@ -102,6 +102,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     # dashdot_damping 参数
     dashpot_damping = connect_params['dashpot_damping']
     drag_damping = connect_params['drag_damping']
+    import pdb; pdb.set_trace()
     global_spring_Y = connect_params['global_spring_Y']
 
     # collide 参数
@@ -327,6 +328,7 @@ if __name__ == "__main__":
     output_dir = './evomesh_optimization_outputs'
     os.makedirs(output_dir, exist_ok=True)
     for obj_case in object_cases:
+        object_cases = 'double_stretch_sloth'
         opt_file = os.path.join(opt_file_path, obj_case, "final_data.pkl")
         params_file = os.path.join(param_file_path, obj_case, "optimal_params.pkl")
         split_file = os.path.join(opt_file_path, obj_case, "split.json")

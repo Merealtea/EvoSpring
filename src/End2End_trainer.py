@@ -1,6 +1,4 @@
 import torch
-
-
 from qqtt.utils import logger, cfg
 import torch.nn as nn
 import torch.distributed as dist
@@ -38,13 +36,16 @@ class E2ETrainer:
 
         self.mdata = self._create_dataset_offline(mode='train')
         self._create_model(cfg.init_spring_Y,
-                                        cfg.drag_damping,
-                                        cfg.dashpot_damping)
+                            cfg.drag_damping,
+                            cfg.dashpot_damping,
+                            cfg.collide_elas,
+                            cfg.collide_fric,
+                            cfg.collide_object_elas,
+                            cfg.collide_object_fric)
         
         # create warp simulator
         self.model.module.load_warp_simulator(self.mdata.simulator)
 
-        
         # 初始化 Warp 优化器（仅在训练模式且 collision_learn 开启时）
         if cfg.collision_learn:
             # 确保 requires_grad=True
@@ -54,41 +55,25 @@ class E2ETrainer:
             self.torch_collide_object_elas = wp.to_torch(self.model.module.simulator.wp_collide_object_elas)
             self.torch_collide_object_fric = wp.to_torch(self.model.module.simulator.wp_collide_object_fric)
 
-            # 弹簧刚度系数 (Spring Stiffness)
-            self.torch_global_spring_Y = wp.to_torch(self.model.module.simulator.wp_spring_Y)
-
-            # 阻尼参数 (Damping Parameters) - 需要先转换为 Warp 数组
-            # 创建可微分的 Warp 数组
-            simulator = self.model.module.simulator
-
-            # drag_damping - 拖拽阻尼系数
-            self.torch_drag_damping = wp.to_torch(simulator.wp_drag_damping)
-
-            # dashpot_damping - 弹簧阻尼系数
-            self.torch_dashpot_damping = wp.to_torch(simulator.wp_dashpot_damping)
-
             # 将所有可微分参数添加到列表
             warp_params_list = [
                 self.torch_collide_elas,
                 self.torch_collide_fric,
                 self.torch_collide_object_elas,
                 self.torch_collide_object_fric,
-                # self.torch_global_spring_Y,
-                # self.torch_drag_damping,
-                # self.torch_dashpot_damping
             ]
-
-
         else:
             warp_params_list = []
 
         self.default_spring_Y = wp.to_torch(self.model.module.simulator.wp_spring_Y).detach().clone()
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr * min(np.sqrt(cfg.train_frame), 1), betas=(0.9, 0.99))
+        # max lr change to 5 for non cloth case
 
         self.collide_optimizer = torch.optim.Adam(warp_params_list,
                                           lr=self.args.lr,
                                           betas=(0.9, 0.99))
+
 
         def linear_warmup_lr(epoch):
             max_lr = self.args.lr  
@@ -110,6 +95,12 @@ class E2ETrainer:
             os.makedirs(dir, exist_ok=True)
 
         self.total_update = 0
+
+        # Track best results across all iterations
+        self.global_best_loss = float('inf')
+        self.global_best_mech_info = None
+        self.global_best_epoch = None
+        self.global_best_iteration = None
 
 
     def _create_dataset_offline(self, mode='train', stride=1):
@@ -133,7 +124,7 @@ class E2ETrainer:
         return mdata
 
 
-    def _create_model(self, init_spring_Y=None, init_drag_damping=None, init_dashpot_damping=None):
+    def _create_model(self, init_spring_Y=None, init_drag_damping=None, init_dashpot_damping=None, init_collision_elas=None, init_collision_fric=None, init_collision_object_elas=None, init_collision_object_fric=None):
         self.object_case = self.args.object_case
 
         self.model = End2End_EvoSpring(
@@ -148,7 +139,11 @@ class E2ETrainer:
             agg_conv_pos=self.args.agg_conv_pos,
             default_spring_Y=init_spring_Y,
             default_drag_damping=init_drag_damping,
-            default_dashpot_damping=init_dashpot_damping
+            default_dashpot_damping=init_dashpot_damping,
+            default_collision_elas=init_collision_elas,
+            default_collision_fric=init_collision_fric,
+            default_collision_object_elas=init_collision_object_elas,
+            default_collision_object_fric=init_collision_object_fric
         )
 
         if self.args.restart_epoch < 0 and not self.args.scratch:
@@ -240,23 +235,59 @@ class E2ETrainer:
     ):
         # Get simulator reference
         simulator = self.model.module.simulator
+        
 
         # 1. Set the mech_info to the simulator for recording
         if mech_info is not None:
             logger.info("Setting predicted mechanical properties to simulator")
-            if mech_info.dim() == 2:
-                predicted_spring_Y = torch.log(mech_info[0] + 1e-8)
-                wp_predicted_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32, requires_grad=False)
-                simulator.set_spring_Y(wp_predicted_spring_Y)
+            if isinstance(mech_info, dict):
+                # Set spring_Y if available
+                if 'log_spring_Y' in mech_info:
+                    predicted_spring_Y = mech_info['log_spring_Y']
+                    wp_predicted_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_spring_Y(wp_predicted_spring_Y)
 
+                # Set drag_damping if available
+                if 'drag_damping' in mech_info:
+                    predicted_drag_damping = mech_info['drag_damping']
+                    wp_predicted_drag_damping = wp.from_torch(predicted_drag_damping.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_drag_damping(wp_predicted_drag_damping)
+
+                # Set dashpot_damping if available
+                if 'dashpot_damping' in mech_info:
+                    predicted_dashpot_damping = mech_info['dashpot_damping']
+                    wp_predicted_dashpot_damping = wp.from_torch(predicted_dashpot_damping.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_dashpot_damping(wp_predicted_dashpot_damping)
+
+                # Set collision parameters if available
+                if 'collision_elas' in mech_info:
+                    predicted_collision_elas = mech_info['collision_elas']
+                    wp_predicted_collision_elas = wp.from_torch(predicted_collision_elas.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_collision_elas(wp_predicted_collision_elas)
+
+                if 'collision_fric' in mech_info:
+                    predicted_collision_fric = mech_info['collision_fric']
+                    wp_predicted_collision_fric = wp.from_torch(predicted_collision_fric.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_collision_fric(wp_predicted_collision_fric)
+
+                if 'collision_object_elas' in mech_info:
+                    predicted_collision_object_elas = mech_info['collision_object_elas']
+                    wp_predicted_collision_object_elas = wp.from_torch(predicted_collision_object_elas.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_collision_object_elas(wp_predicted_collision_object_elas)
+
+                if 'collision_object_fric' in mech_info:
+                    predicted_collision_object_fric = mech_info['collision_object_fric']
+                    wp_predicted_collision_object_fric = wp.from_torch(predicted_collision_object_fric.reshape(1).contiguous(), dtype=wp.float32, requires_grad=False)
+                    simulator.set_collision_object_fric(wp_predicted_collision_object_fric)
             else:
-                logger.warning("mech_info has unexpected dimensions, skipping property update")
+                logger.warning("mech_info has unexpected format (expected dict), skipping property update")
 
         # 2. Start simulation and record the trajectory
         frame_len = cfg.train_frame + cfg.test_frame
         simulator.set_init_state(
             simulator.wp_init_vertices, simulator.wp_init_velocities
         )
+        
         vertices = [
             wp.to_torch(simulator.wp_states[0].wp_x, requires_grad=False).cpu()
         ]
@@ -347,18 +378,18 @@ class E2ETrainer:
 
         return m_ids, m_gs, m_gs_parents, node_in_feature, edge_mech_in_feature
     
-    def generate_data_point_sequence(self, update_frame_num, enable_backward=False, default_loss=None):
+    def generate_data_point_sequence(self, update_frame_num, enable_backward=False):
         simulator = self.model.module.simulator
         vertices_sequence = []
         velocities_sequence = []
 
         # 存储所有可微分参数的梯度序列
         grad_sequences = {
-            'spring_Y': [],
-            'collide_elas': [],
-            'collide_fric': [],
-            'collide_object_elas': [],
-            'collide_object_fric': [],
+            'log_spring_Y': [],
+            'collision_elas': [],
+            'collision_fric': [],
+            'collision_object_elas': [],
+            'collision_object_fric': [],
             'drag_damping': [],
             'dashpot_damping': []
         }
@@ -369,39 +400,42 @@ class E2ETrainer:
         track_losses = []
 
         # 将 cfg.device 更新为 Warp 兼容的字符串或直接获取 Warp device 对象
-
-        # 初始状态记录 ... (保持不变)
-        simulator.set_init_state(simulator.wp_init_vertices, simulator.wp_init_velocities)
+        self.model.module.simulator.set_init_state(
+            self.model.module.simulator.wp_init_vertices, 
+            self.model.module.simulator.wp_init_velocities
+        )
+        
         vertices_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[0].wp_x).clone(), wp.to_torch(simulator.wp_states[0].wp_control_x).clone()]))
         velocities_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[0].wp_v).clone(), wp.to_torch(simulator.wp_states[0].wp_control_v).clone()]))
 
         valid_frames = 0
+        
         for frame_idx in tqdm(range(1, update_frame_num)):
-            simulator.set_controller_target(frame_idx)
+            self.model.module.simulator.set_controller_target(frame_idx)
 
             # Record data
             vertices_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_x).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_x).clone()]))
             velocities_sequence.append(torch.cat([wp.to_torch(simulator.wp_states[-1].wp_v).clone(), wp.to_torch(simulator.wp_states[-1].wp_control_v).clone()]))
 
-
-            if simulator.object_collision_flag:
-                simulator.update_collision_graph()
+            if self.model.module.simulator.object_collision_flag:
+                self.model.module.simulator.update_collision_graph()
 
             # 计算 Loss
             if cfg.use_graph:
-                wp.capture_launch(simulator.graph)
+                wp.capture_launch(self.model.module.simulator.graph)
             else:
                 if cfg.data_type == "real":
-                    with simulator.tape:
-                        simulator.step()
-                        simulator.calculate_loss()
-                    simulator.tape.backward(simulator.loss)
+                    with self.model.module.simulator.tape:
+                        self.model.module.simulator.step()
+                        self.model.module.simulator.calculate_loss()
+                    self.model.module.simulator.tape.backward(self.model.module.simulator.loss)
                 else:
-                    with simulator.tape:
-                        simulator.step()
-                        simulator.calculate_simple_loss()
-                    simulator.tape.backward(simulator.loss)
-
+                    with self.model.module.simulator.tape:
+                        self.model.module.simulator.step()
+                        self.model.module.simulator.calculate_simple_loss()
+                    self.model.module.simulator.tape.backward(self.model.module.simulator.loss)
+            self.model.module.simulator.export_forces_to_txt(frame_idx=frame_idx, filename="simulation_forces.txt")
+            import pdb; pdb.set_trace()
             valid_frames += 1
 
             # 提取所有可微分参数的梯度
@@ -409,31 +443,31 @@ class E2ETrainer:
 
             # spring_Y 梯度
             if simulator.wp_spring_Y.grad is not None:
-                grad_dict['spring_Y'] = wp.to_torch(simulator.wp_spring_Y.grad).clone()
+                grad_dict['log_spring_Y'] = wp.to_torch(simulator.wp_spring_Y.grad).clone()
             else:
-                grad_dict['spring_Y'] = torch.zeros_like(wp.to_torch(simulator.wp_spring_Y))
+                grad_dict['log_spring_Y'] = torch.zeros_like(wp.to_torch(simulator.wp_spring_Y))
 
             # 碰撞参数梯度
             if cfg.collision_learn:
                 if simulator.wp_collide_elas.grad is not None:
-                    grad_dict['collide_elas'] = wp.to_torch(simulator.wp_collide_elas.grad).clone()
+                    grad_dict['collision_elas'] = wp.to_torch(simulator.wp_collide_elas.grad).clone()
                 else:
-                    grad_dict['collide_elas'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_elas))
+                    grad_dict['collision_elas'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_elas))
 
                 if simulator.wp_collide_fric.grad is not None:
-                    grad_dict['collide_fric'] = wp.to_torch(simulator.wp_collide_fric.grad).clone()
+                    grad_dict['collision_fric'] = wp.to_torch(simulator.wp_collide_fric.grad).clone()
                 else:
-                    grad_dict['collide_fric'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_fric))
+                    grad_dict['collision_fric'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_fric))
 
                 if simulator.wp_collide_object_elas.grad is not None:
-                    grad_dict['collide_object_elas'] = wp.to_torch(simulator.wp_collide_object_elas.grad).clone()
+                    grad_dict['collision_object_elas'] = wp.to_torch(simulator.wp_collide_object_elas.grad).clone()
                 else:
-                    grad_dict['collide_object_elas'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_object_elas))
+                    grad_dict['collision_object_elas'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_object_elas))
 
                 if simulator.wp_collide_object_fric.grad is not None:
-                    grad_dict['collide_object_fric'] = wp.to_torch(simulator.wp_collide_object_fric.grad).clone()
+                    grad_dict['collision_object_fric'] = wp.to_torch(simulator.wp_collide_object_fric.grad).clone()
                 else:
-                    grad_dict['collide_object_fric'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_object_fric))
+                    grad_dict['collision_object_fric'] = torch.zeros_like(wp.to_torch(simulator.wp_collide_object_fric))
 
                 # 阻尼参数梯度 (Damping Parameters)
                 # 检查 simulator 是否有 Warp 数组版本的阻尼参数
@@ -453,7 +487,6 @@ class E2ETrainer:
                     # 如果没有 Warp 数组版本，创建标量零梯度
                     grad_dict['dashpot_damping'] = torch.zeros(1, dtype=torch.float32, device=cfg.device)
 
-            loss = wp.to_torch(simulator.loss, requires_grad=False)
 
             # 提取 chamfer_loss 和 track_loss (仅对 real 数据)
             if cfg.data_type == "real":
@@ -463,8 +496,11 @@ class E2ETrainer:
                 chamfer_loss = torch.tensor(0.0)
                 track_loss = torch.tensor(0.0)
 
+            loss = wp.to_torch(simulator.loss, requires_grad=False)
+
             # 检查梯度是否有 NaN
             has_nan = False
+
             for param_name, grad in grad_dict.items():
                 if torch.isnan(grad).any():
                     print(f'Gradient of {param_name} turns to nan in step {frame_idx}')
@@ -472,7 +508,7 @@ class E2ETrainer:
 
             if has_nan:
                 break
-
+            
             losses.append(loss.item())
             chamfer_losses.append(chamfer_loss.item())
             track_losses.append(track_loss.item())
@@ -495,15 +531,15 @@ class E2ETrainer:
                 simulator.wp_states[-1].wp_v
             )
 
-        # 转换输出张量 ... (保持不变)
-        vertices_tensor = torch.stack(vertices_sequence, dim=0)
-        velocities_tensor = torch.stack(velocities_sequence, dim=0)
-        node_mass = torch.cat([wp.to_torch(simulator.wp_masses).clone(), torch.zeros(simulator.num_control_points, device=vertices_tensor.device)])
-        spring_Y = wp.to_torch(simulator.wp_spring_Y).clone()
+        # # 转换输出张量 ... (保持不变)
+        vertices_tensor = [] # torch.stack(vertices_sequence, dim=0)
+        velocities_tensor =  [] # torch.stack(velocities_sequence, dim=0)
+        node_mass = [] # torch.cat([wp.to_torch(simulator.wp_masses).clone(), torch.zeros(simulator.num_control_points, device=vertices_tensor.device)])
+        spring_Y = [] # wp.to_torch(simulator.wp_spring_Y).clone()
 
-        spring_rest_length = wp.to_torch(simulator.wp_rest_lengths).clone()
-        spring_dashpot_damping = simulator.wp_dashpot_damping
-        drag_damping = simulator.wp_drag_damping
+        spring_rest_length = [] # wp.to_torch(simulator.wp_rest_lengths).clone()
+        spring_dashpot_damping = None # simulator.wp_dashpot_damping
+        drag_damping = None # simulator.wp_drag_damping
 
         if enable_backward:
             # 计算所有参数的平均梯度
@@ -511,11 +547,13 @@ class E2ETrainer:
             for param_name, grad_list in grad_sequences.items():
                 if len(grad_list) == 0:
                     # 如果没有梯度，创建零梯度
-                    if param_name == 'spring_Y':
+                    if param_name == 'log_spring_Y':
                         grad_avg_dict[param_name] = torch.zeros_like(spring_Y)
-                    elif param_name in ['collide_elas', 'collide_fric', 'collide_object_elas', 'collide_object_fric']:
+                    elif param_name in ['collision_elas', 'collision_fric', 'collision_object_elas', 'collision_object_fric']:
                         if cfg.collision_learn:
-                            grad_avg_dict[param_name] = torch.zeros_like(wp.to_torch(getattr(simulator, f'wp_{param_name}')))
+                            # 将 collision_ 前缀转换为 collide_ 以匹配 simulator 属性名
+                            wp_param_name = 'wp_' + param_name.replace('collision_', 'collide_')
+                            grad_avg_dict[param_name] = torch.zeros_like(wp.to_torch(getattr(simulator, wp_param_name)))
                     elif param_name in ['drag_damping', 'dashpot_damping']:
                         if cfg.collision_learn:
                             # 为阻尼参数创建标量零梯度
@@ -533,30 +571,11 @@ class E2ETrainer:
     def run_epoch(self, epoch, 
                   mode='train', 
                   ):
-
-        self.model.module.simulator.set_init_state(
-            self.model.module.simulator.wp_init_vertices, 
-            self.model.module.simulator.wp_init_velocities
-        )
-
-        wp_default_spring_Y = wp.from_torch(self.default_spring_Y.contiguous().clone(), dtype=wp.float32, requires_grad=False)
-
-        self.model.module.simulator.set_spring_Y(wp_default_spring_Y)
-
-        _, _, _, _, _, _, _, losses, chamfer_losses, track_losses, _, valid_frames = \
-            self.generate_data_point_sequence(
-                update_frame_num=cfg.train_frame,
-                enable_backward=True,
-            )
-
         # get node_pos, node_mass, rest_length , drag_damping, dashpot_damping in first frame from mdata
         train_node_pos = torch.FloatTensor(self.mdata.mesh_pos)
-        train_node_mass = torch.FloatTensor(self.mdata.masses)[:, None]
         train_node_type = torch.FloatTensor(self.mdata.node_type[0])
         spring_rest_length = torch.FloatTensor(self.mdata.spring_rest_length)[:, None]
-        spring_dashpot_damping = torch.ones_like(spring_rest_length) # * self.mdata.dashpot_damping
-        drag_damping = torch.ones_like(train_node_mass) # * self.mdata.drag_damping
-
+   
         # normalize train node pos into [-1,1]
         pos_min = train_node_pos.min(dim=0, keepdim=True)[0]
         pos_max = train_node_pos.max(dim=0, keepdim=True)[0]
@@ -580,8 +599,7 @@ class E2ETrainer:
         edge_mech_in_feature = torch.cat(
             [spring_rest_length, spring_encoded], dim = 1
         )
-
-
+        
         m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature =\
               self._preproc_multi_infos(self.mdata, node_in_feature, edge_mech_in_feature)
 
@@ -600,39 +618,55 @@ class E2ETrainer:
                 # Note: You may need to adjust this based on actual mech_info structure
                 st = time()
 
-                new_spring_Y, new_drag_damping, new_dashpot_damping, edge_logits\
-                    = self.model(m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature, attn_mask)
-                
-                log_new_spring_Y = torch.log(new_spring_Y + 1e-8)  # 添加小值避免 log(0)
+                new_spring_Y, drag_damping_out, dashpot_damping_out =\
+                      self.model(m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature, attn_mask)
+                log_new_spring_Y = torch.log(new_spring_Y) #+ 1e-8)  # 添加小值避免 log(0)
 
                 # [关键] 映射到 Warp 时，必须设置 requires_grad=True
                 # 这样 Warp 才会为这些数组分配梯度缓冲区，供 Tape 使用
-                
+
                 wp_predicted_spring_Y = wp.from_torch(
                     log_new_spring_Y.contiguous(), dtype=wp.float32, requires_grad=True
                 )
 
-                # Convert scalar damping parameters to Warp arrays
+                # Convert predicted damping values to warp
                 wp_predicted_drag_damping = wp.from_torch(
-                    new_drag_damping.reshape(1).contiguous(), dtype=wp.float32, requires_grad=True
+                    drag_damping_out.contiguous(), dtype=wp.float32, requires_grad=True
                 )
                 wp_predicted_dashpot_damping = wp.from_torch(
-                    new_dashpot_damping.reshape(1).contiguous(), dtype=wp.float32, requires_grad=True
+                    dashpot_damping_out.contiguous(), dtype=wp.float32, requires_grad=True
                 )
 
-                # Set all predicted parameters to simulator
+                # # Convert predicted collision values to warp
+                # wp_predicted_collision_elas = wp.from_torch(
+                #     collision_elas_out.contiguous(), dtype=wp.float32, requires_grad=True
+                # )
+                # wp_predicted_collision_fric = wp.from_torch(
+                #     collision_fric_out.contiguous(), dtype=wp.float32, requires_grad=True
+                # )
+                # wp_predicted_collision_object_elas = wp.from_torch(
+                #     collision_object_elas_out.contiguous(), dtype=wp.float32, requires_grad=True
+                # )
+                # wp_predicted_collision_object_fric = wp.from_torch(
+                #     collision_object_fric_out.contiguous(), dtype=wp.float32, requires_grad=True
+                # )
+
+                # Set predicted spring_Y and damping to simulator
                 self.model.module.simulator.set_spring_Y(wp_predicted_spring_Y)
                 self.model.module.simulator.set_drag_damping(wp_predicted_drag_damping)
                 self.model.module.simulator.set_dashpot_damping(wp_predicted_dashpot_damping)
+                # self.model.module.simulator.set_collision_elas(wp_predicted_collision_elas)
+                # self.model.module.simulator.set_collision_fric(wp_predicted_collision_fric)
+                # self.model.module.simulator.set_collision_object_elas(wp_predicted_collision_object_elas)
+                # self.model.module.simulator.set_collision_object_fric(wp_predicted_collision_object_fric)
 
                 print("Forward time is : {}".format(time() - st))
                 st = time()
-
+                
                 pos, vel, _, _, _, _, _, loss_val, chamfer_loss_val, track_loss_val, grad_avg_dict, valid_frames = \
                     self.generate_data_point_sequence(
                     update_frame_num=cfg.train_frame,
                     enable_backward=True,
-                    default_loss=losses,
                 )
 
                 self.total_update += 1
@@ -640,77 +674,112 @@ class E2ETrainer:
                 # Print spring_Y average
                 print(f"\n{'='*60}")
                 print(f"Spring Y iteration {i+1}/10")
-                print(f"spring_Y grad Average: {grad_avg_dict['spring_Y'].mean().item()}")
+                print(f"spring_Y grad Average: {grad_avg_dict['log_spring_Y'].mean().item()}")
                 print(f"Spring_Y Average: {log_new_spring_Y.mean().item():.6f}")
-                print(f"Loss sum: {np.sum(loss_val):.10f}, default loss sum: {np.sum(losses):.10f}")
+                print(f"drag_damping grad Average: {grad_avg_dict['drag_damping'].mean().item()}")
+                print(f"Drag_Damping: {drag_damping_out.item():.6f}")
+                print(f"dashpot_damping grad Average: {grad_avg_dict['dashpot_damping'].mean().item()}")
+                print(f"Dashpot_Damping: {dashpot_damping_out.item():.6f}")
+                # print(f"collision_elas grad Average: {grad_avg_dict['collision_elas'].mean().item()}")
+                # print(f"Collision_Elas: {collision_elas_out.item():.6f}")
+                # print(f"collision_fric grad Average: {grad_avg_dict['collision_fric'].mean().item()}")
+                # print(f"Collision_Fric: {collision_fric_out.item():.6f}")
+                # print(f"collision_object_elas grad Average: {grad_avg_dict['collision_object_elas'].mean().item()}")
+                # print(f"Collision_Object_Elas: {collision_object_elas_out.item():.6f}")
+                # print(f"collision_object_fric grad Average: {grad_avg_dict['collision_object_fric'].mean().item()}")
+                # print(f"Collision_Object_Fric: {collision_object_fric_out.item():.6f}")
+                print(f"Loss sum: {np.sum(loss_val):.10f}")
                 print(f"Chamfer loss sum: {np.sum(chamfer_loss_val):.10f}")
                 print(f"Track loss sum: {np.sum(track_loss_val):.10f}")
                 print(f"Valid frames: {valid_frames}")
                 print(f"{'='*60}\n")
 
-                # Calculate masked spring ratio from edge_logits (edge_probs_soft)
-                # edge_logits[..., 0] is the probability of discarding the edge
-                # edge_logits[..., 1] is the probability of keeping the edge
-                with torch.no_grad():
-                    discard_probs = edge_logits[..., 0]
-                    # Count edges with discard probability > 0.5 as masked
-                    kept_springs = (discard_probs > 0.5).sum().item()
-                    total_springs = discard_probs.numel()
-                    kept_ratio = kept_springs / total_springs if total_springs > 0 else 0.0
 
                 self.writer.add_scalar('Spring_Y_update/overall_Loss', np.sum(loss_val), self.total_update)
                 self.writer.add_scalar('Spring_Y_update/chamfer_Loss', np.sum(chamfer_loss_val), self.total_update)
                 self.writer.add_scalar('Spring_Y_update/track_Loss', np.sum(track_loss_val), self.total_update)
                 self.writer.add_scalar('Spring_Y_update/Spring_Y_Average', log_new_spring_Y.mean().item(), self.total_update)
-                self.writer.add_scalar('Spring_Y_update/Masked_Spring_Ratio', kept_ratio, self.total_update)
-                self.writer.add_scalar('Spring_Y_update/Edge_Keep_Prob_Mean', edge_logits[..., 0].mean().item(), self.total_update)
-                # self.writer.add_scalar('Single Frame/Rest_Length_Average', new_rest_length.mean().item(), self.total_update)
- 
+                self.writer.add_scalar('Spring_Y_update/Drag_Damping', drag_damping_out.item(), self.total_update)
+                self.writer.add_scalar('Spring_Y_update/Dashpot_Damping', dashpot_damping_out.item(), self.total_update)
+                # self.writer.add_scalar('Spring_Y_update/Collision_Elas', collision_elas_out.item(), self.total_update)
+                # self.writer.add_scalar('Spring_Y_update/Collision_Fric', collision_fric_out.item(), self.total_update)
+                # self.writer.add_scalar('Spring_Y_update/Collision_Object_Elas', collision_object_elas_out.item(), self.total_update)
+                # self.writer.add_scalar('Spring_Y_update/Collision_Object_Fric', collision_object_fric_out.item(), self.total_update)
+
                 # -------------------------------------------------------
                 # [核心修复] 使用平均梯度更新模型
                 # -------------------------------------------------------
 
-                # 1. 新增：计算 edge_logits 的正则化 Loss
-                # 加负号是因为我们要最大化均值（优化器是最小化 Loss）
-                reg_weight = 0.001  # 正则项权重，你可以根据实际情况调整这个超参数
-                edge_reg_loss = -edge_logits[..., 0].mean() * reg_weight
-
                 # 将平均梯度手动注入 PyTorch 计算图
-                # 2. 新增：将 edge_reg_loss 加入反向传播列表
-                tensors_to_backward = [log_new_spring_Y, edge_reg_loss]
+                # 2. 新增：将 edge_reg_loss 和 damping 参数加入反向传播列表
+                tensors_to_backward = [log_new_spring_Y,
+                                       drag_damping_out,
+                                       dashpot_damping_out,]
+                                    #    collision_elas_out,
+                                    #    collision_fric_out,
+                                    #    collision_object_elas_out,
+                                    #    collision_object_fric_out]
                 # edge_reg_loss 是标量 Loss，它在这个层级的起始梯度就是 1.0
-                grad_tensors_to_backward = [grad_avg_dict['spring_Y'], torch.tensor(1.0, device=edge_logits.device)]
-
-                # 添加 damping 参数的梯度
-                if cfg.collision_learn:
-                    if 'drag_damping' in grad_avg_dict:
-                        tensors_to_backward.append(new_drag_damping)
-                        grad_tensors_to_backward.append(grad_avg_dict['drag_damping'])
-
-                    if 'dashpot_damping' in grad_avg_dict:
-                        tensors_to_backward.append(new_dashpot_damping)
-                        grad_tensors_to_backward.append(grad_avg_dict['dashpot_damping'])
+                grad_tensors_to_backward = [grad_avg_dict['log_spring_Y'],
+                                            grad_avg_dict['drag_damping'],
+                                            grad_avg_dict['dashpot_damping'],]
+                                            # grad_avg_dict['collision_elas'],
+                                            # grad_avg_dict['collision_fric'],
+                                            # grad_avg_dict['collision_object_elas'],
+                                            # grad_avg_dict['collision_object_fric']]
 
                 # 一并执行反向传播
                 torch.autograd.backward(
                     tensors=tensors_to_backward,
                     grad_tensors=grad_tensors_to_backward
                 )
-                # 打印模型梯度
-                # print(f"\n{'='*60}")
-                # print("Model Gradients:")
-                # for name, param in self.model.named_parameters():
-                #     if param.grad is not None:
-                #         grad_mean = param.grad.abs().mean().item()
-                #         grad_max = param.grad.abs().max().item()
-                #         print(f"  {name}: mean={grad_mean:.6e}, max={grad_max:.6e}")
-                #     else:
-                #         print(f"  {name}: No gradient")
-                # print(f"{'='*60}\n")
 
                 # PyTorch 优化器更新神经网络参数
                 self.optimizer.step()
                 print(f"Model updated with average gradient per frame")
+
+                # Check if this is the best iteration and save immediately
+                current_loss = np.sum(loss_val)
+                if  current_loss < self.global_best_loss:
+                    prev_best_loss = self.global_best_loss
+                    self.global_best_loss = current_loss
+                    self.global_best_epoch = epoch
+                    self.global_best_iteration = i
+
+                    # Save best model checkpoint
+                    best_ckpt_path = os.path.join(self.args.dump_dir, 'ckpts', f'best_iter_epoch{epoch}_iter{i}_{self.checkpt_name}')
+                    torch.save(self.model.module.state_dict(), best_ckpt_path)
+
+                    # Save best mech_info
+                    best_mech_info = {
+                        'log_spring_Y': log_new_spring_Y.detach(),
+                        'drag_damping': drag_damping_out.detach().clone(),
+                        'dashpot_damping': dashpot_damping_out.detach().clone(),
+                        # 'collision_elas': collision_elas_out.detach().clone(),
+                        # 'collision_fric': collision_fric_out.detach().clone(),
+                        # 'collision_object_elas': collision_object_elas_out.detach().clone(),
+                        # 'collision_object_fric': collision_object_fric_out.detach().clone()
+                    }
+                    self.global_best_mech_info = best_mech_info.copy()
+                    best_mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', f'best_iter_epoch{epoch}_iter{i}_{self.checkpt_name}')
+                    torch.save(best_mech_info, best_mech_info_path)
+
+                    # Save best trajectory
+                    best_traj_path = os.path.join(self.args.dump_dir, 'trajectories', 'best_trajectory.pkl')
+                    logger.info(f"New best loss {current_loss:.10f} at epoch {epoch}, iteration {i+1}/10. Saving checkpoint and trajectory...")
+                    self.save_traj(mech_info={k: v.clone() for k, v in best_mech_info.items()}, save_path=best_traj_path, compute_loss=True)
+
+                    # Log to tensorboard
+                    self.writer.add_scalar('Best/loss', current_loss, self.total_update)
+                    self.writer.add_scalar('Best/epoch', epoch, self.total_update)
+                    self.writer.add_scalar('Best/iteration', i, self.total_update)
+
+                    print(f"\n{'='*60}")
+                    print(f"NEW BEST RESULT SAVED!")
+                    print(f"Epoch: {epoch}, Iteration: {i+1}/10")
+                    print(f"Loss: {current_loss:.10f}")
+                    print(f"Previous best: {prev_best_loss:.10f}")
+                    print(f"{'='*60}\n")
 
             # Update collide parameters first (10 iterations)
             if cfg.collision_learn:
@@ -718,7 +787,7 @@ class E2ETrainer:
                 print("Starting collide parameters optimization...")
                 print(f"{'='*60}\n")
 
-                for i in range(10):
+                for i in range(5):
                     loss_val = []
 
                     # Reset position and velocity
@@ -777,9 +846,6 @@ class E2ETrainer:
                     print(f"  collide_fric: {self.torch_collide_fric.mean().item():.6f}")
                     print(f"  collide_object_elas: {self.torch_collide_object_elas.mean().item():.6f}")
                     print(f"  collide_object_fric: {self.torch_collide_object_fric.mean().item():.6f}")
-                    print(f"  global_spring_Y: {self.torch_global_spring_Y.mean().item():.6f}")
-                    print(f"  drag_damping: {self.torch_drag_damping.item():.6f}")
-                    print(f"  dashpot_damping: {self.torch_dashpot_damping.item():.6f}")
                     # if self.torch_collision_dist is not None:
                     #     print(f"  collision_dist: {self.torch_collision_dist.item():.6f}")
                     print(f"{'='*60}\n")
@@ -816,25 +882,20 @@ class E2ETrainer:
         else:
             self.model.eval()
 
-        final_mech_info = torch.stack([new_spring_Y]
-                                       , dim=0).detach()  # 这里根据实际 mech_info 结构调整
+        final_mech_info = {
+            'log_spring_Y': log_new_spring_Y.detach(),
+            'drag_damping': drag_damping_out.detach(),
+            'dashpot_damping': dashpot_damping_out.detach(),
+            # 'collision_elas': collision_elas_out.detach(),
+            # 'collision_fric': collision_fric_out.detach(),
+            # 'collision_object_elas': collision_object_elas_out.detach(),
+            # 'collision_object_fric': collision_object_fric_out.detach()
+        }
 
         return mean_loss, final_mech_info
 
     
     def train(self):
-        # load phystwin zero-grad optimization results and warp simulator here
-        best_mech_info = None
-        best_epoch = None
-
-        # Early stopping parameters for mech_info convergence
-        prev_mech_info = None
-        mech_info_change_threshold = 1e-7  # Relative change threshold
-        patience = 100  # Number of epochs to wait before stopping
-        patience_counter = 0
-
-        # Early stopping parameters for loss non-improvement  # Number of epochs to wait for loss improvement
-        loss_patience_counter = 0
 
         # Save initial trajectory before training
         initial_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'initial_trajectory.pkl')
@@ -842,11 +903,11 @@ class E2ETrainer:
         frame_losses, chamfer_losses, track_losses, save_data\
             = self.save_traj(mech_info=None, save_path=initial_traj_save_path, compute_loss=True)
 
-        best_loss = np.sum(frame_losses[1:cfg.train_frame])  # Initialize best_loss with the initial trajectory loss
-
-        # get initial mech_info from zero-grad optimization results
-        # spring_rest_length = torch.FloatTensor(self.mdata.spring_rest_length).to(cfg.device)
-        # init_spring_Y = torch.log(torch.ones_like(spring_rest_length) * self.mdata.init_spring_Y)
+        # Initialize global_best_loss with the initial trajectory loss if not set
+        initial_loss = np.sum(frame_losses[1:cfg.train_frame])
+        if self.global_best_loss == float('inf'):
+            self.global_best_loss = initial_loss
+            logger.info(f"Initialized global_best_loss with initial trajectory loss: {initial_loss:.10f}")
 
         for epoch in self.pbar:
             mean_loss_train, mech_info = self.run_epoch(epoch, 
@@ -859,8 +920,9 @@ class E2ETrainer:
                     self.writer.add_scalar('lr/train', self.optimizer.param_groups[0]['lr'], epoch)
                     
                     # record mean value of mech_info for monitoring
-                    self.writer.add_scalar('mech_info/spring_Y', mech_info[0].mean().item(), epoch)
-                    # self.writer.add_scalar('mech_info/rest_length', mech_info[1].mean().item(), epoch)
+                    self.writer.add_scalar('mech_info/log_spring_Y', mech_info['log_spring_Y'].mean().item(), epoch)
+                    self.writer.add_scalar('mech_info/drag_damping', mech_info['drag_damping'].item(), epoch)
+                    self.writer.add_scalar('mech_info/dashpot_damping', mech_info['dashpot_damping'].item(), epoch)
 
                     # dump ckpt
                     ckpt_path = os.path.join(self.args.dump_dir, 'ckpts', str(epoch) + "_" + self.checkpt_name)
@@ -868,85 +930,25 @@ class E2ETrainer:
                     
                     # dump spring emch info
                     mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', str(epoch) + "_" + self.checkpt_name)
-                    torch.save(mech_info.clone(), mech_info_path)
+                    torch.save({k: v.clone() for k, v in mech_info.items()}, mech_info_path)
 
                     # save trajectory with current mech_info
                     traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', f'epoch_{epoch}_trajectory.pkl')
                     logger.info(f"Saving trajectory for epoch {epoch}")
 
-                    cur_frame_losses, chamfer_losses, _, _\
-                        = self.save_traj(mech_info=mech_info.clone(), 
-                                         save_path=traj_save_path, compute_loss=True)
+                    self.save_traj(mech_info={k: v.clone() for k, v in mech_info.items()},
+                                         save_path=traj_save_path)
 
-                    mean_loss_train = np.sum(cur_frame_losses[1:cfg.train_frame])  # Initialize best_loss with the initial trajectory loss
+        # dump best spring mech info estimation
+        if self.global_best_epoch is not None:
+            if self.global_best_iteration is not None:
+                mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', f"final_best_epoch{self.global_best_epoch}_iter{self.global_best_iteration}.pth")
+            else:
+                mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', f"final_best_epoch{self.global_best_epoch}.pth")
+            torch.save(self.global_best_mech_info, mech_info_path)
+            logger.info(f"Training completed. Best loss: {self.global_best_loss:.10f} at epoch {self.global_best_epoch}" +
+                       (f", iteration {self.global_best_iteration}" if self.global_best_iteration is not None else ""))
 
-                    # Check for loss improvement
-                    if best_loss > mean_loss_train :
-                        logger.info(f"New best loss {mean_loss_train:.10f} at epoch {epoch}, prev best loss is {best_loss:.10f}, saving best trajectory")
-                        # Loss improved significantly
-                        best_mech_info = mech_info.clone()
-                        best_epoch = epoch
-                        best_loss = mean_loss_train
-                        loss_patience_counter = 0  # Reset loss patience counter
-
-                        # Save best trajectory
-                        best_traj_save_path = os.path.join(self.args.dump_dir, 'trajectories', 'best_trajectory.pkl')
-                        
-                        frame_losses, _, _, _\
-                             = self.save_traj(mech_info=mech_info.clone(), save_path=best_traj_save_path, compute_loss=True)
-                    else:
-                        # Loss did not improve
-                        loss_patience_counter += 1
-                        logger.info(f"Current loss: {mean_loss_train:.10f}, Best loss: {best_loss:.10f}")
-                        logger.info(f"Loss did not improve. Loss patience counter: {loss_patience_counter}/{patience}")
-                        self.writer.add_scalar('early_stopping/loss_patience_counter', loss_patience_counter, epoch)
-
-                        if loss_patience_counter >= patience:
-                            logger.info(f"Early stopping triggered at epoch {epoch}. Loss has not improved for {patience} epochs.")
-                            self.pbar.close()
-                            # Save final best mech_info before stopping
-                            mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', "best_{}.pth".format(best_epoch))
-                            torch.save(best_mech_info, mech_info_path)
-                            return
-
-                    # Check mech_info convergence for early stopping
-                    if prev_mech_info is not None:
-                        # Calculate relative change in mech_info
-                        mech_info_diff = torch.abs(mech_info - prev_mech_info)
-                        mech_info_norm = torch.abs(prev_mech_info) + 1e-8  # Avoid division by zero
-                        relative_change = (mech_info_diff / mech_info_norm).mean().item()
-
-                        logger.info(f"Epoch {epoch}: mech_info relative change = {relative_change:.6f}")
-                        self.writer.add_scalar('mech_info/relative_change', relative_change, epoch)
-
-                        if relative_change < mech_info_change_threshold:
-                            patience_counter += 1
-                            logger.info(f"mech_info change below threshold. Patience counter: {patience_counter}/{patience}")
-
-                            if patience_counter >= patience:
-                                logger.info(f"Early stopping triggered at epoch {epoch}. mech_info has converged.")
-                                self.pbar.close()
-                                # Save final best mech_info before stopping
-                                mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', "best_{}.pth".format(best_epoch))
-                                torch.save(best_mech_info, mech_info_path)
-                                return
-                        else:
-                            patience_counter = 0  # Reset counter if change is above threshold
-
-                    # Update prev_mech_info for next epoch
-                    prev_mech_info = mech_info.clone()
-
-                # valid loss record
-                if self.args.n_valid > 0 and (epoch+1) % 5 == 0:
-                    mean_loss_valid, _ = self.run_epoch(epoch, 'test')
-                    if dist.get_rank() == 0:
-                        self.writer.add_scalar('RMSE/test', math.sqrt(mean_loss_valid), epoch)
-                dist.barrier()
-        
-        # dump best spring emch info estimation
-        mech_info_path = os.path.join(self.args.dump_dir, 'spring_mech_info', "best_{}.pth".format(best_epoch))
-        torch.save(best_mech_info, mech_info_path)
-    
     def test(self, epoch=None):
         self.model.eval()
         epoch = self.args.restart_epoch if epoch==None else epoch
@@ -1012,169 +1014,3 @@ class E2ETrainer:
                 dump_path = os.path.join(dir, str(id) + '.csv')
                 np.savetxt(dump_path, instance_rollout_error, delimiter=',')
                 errors.append(np.mean(instance_rollout_error))
-
-    def visualize_simulation(self, mech_info_path, output_video_path='simulation_visualization.mp4'):
-        """
-        Run pure inference simulation and create PyVista visualization video.
-
-        Args:
-            mech_info_path: Path to the best_mech_info .pth file
-            output_video_path: Path to save the output video
-        """
-        import pyvista as pv
-        import h5py
-
-        self.model.eval()
-
-        with torch.autograd.no_grad():
-            # Load dataset
-            mdata = self._create_datset_offline(mode='train')
-
-            # Load config
-        if "cloth" in mdata.object_case or "package" in mdata.object_case:
-            cfg.load_from_yaml("configs/phystwin_configs/cloth.yaml")
-        else:
-            cfg.load_from_yaml("configs/phystwin_configs/real.yaml")
-
-        cfg.device = next(self.model.parameters()).device
-
-        # Load warp simulator
-        self.model.module.load_warp_simulator(
-            dt=mdata.dt,
-            init_vertices=mdata.mesh_pos,
-            init_springs=mdata.cells,
-            init_spring_Y=mdata.spring_Y[0],
-            init_rest_lengths=mdata.spring_rest_length,
-            init_masses=mdata.masses,
-            num_object_springs=mdata.spring_Y.shape[0],
-            init_masks=None,
-            init_velocities=mdata.velocity,
-            num_all_points=mdata.num_object_points,
-            num_surface_points=mdata.num_surface_points,
-            num_original_points=mdata.num_original_points,
-            controller_points=mdata.controller_point,
-            object_points=mdata.object_point,
-            object_visibilities=mdata.object_visibilities,
-            object_motions_valid=mdata.object_motions_valid,
-            collide_elas=mdata.collide_elas,
-            collide_fric=mdata.collide_fric,
-            dashpot_damping=mdata.dashpot_damping,
-            drag_damping=mdata.drag_damping,
-            collide_object_elas=mdata.collide_object_elas,
-            collide_object_fric=mdata.collide_object_fric,
-            collision_dist=mdata.collision_dist,
-            reverse_z=cfg.reverse_z,
-            spring_Y_min=cfg.spring_Y_min,
-            spring_Y_max=cfg.spring_Y_max,
-            self_collision=cfg.self_collision,
-            num_substeps=cfg.num_substeps,
-            device=cfg.device,
-        )
-
-        # Load best_mech_info
-        logger.info(f"Loading mech_info from: {mech_info_path}")
-        mech_info = torch.load(mech_info_path, map_location=cfg.device)
-
-        # Update simulator with predicted mechanical properties
-        if mech_info is not None and mech_info.dim() == 2:
-            predicted_spring_Y = mech_info[:, 0]
-            self.model.module.simulator.wp_spring_Y = wp.from_torch(predicted_spring_Y.contiguous(), dtype=wp.float32)
-
-            predicted_rest_length = mech_info[:, 1]
-            self.model.module.simulator.wp_rest_lengths = wp.from_torch(predicted_rest_length.contiguous(), dtype=wp.float32)
-
-        # Run pure inference simulation and collect all points data
-        simulator = self.model.module.simulator
-
-        # Storage for visualization data
-        object_points_sequence = []  # Simulated object points
-        controller_points_sequence = []  # Controller points
-        gt_object_points_sequence = []  # Ground truth object points
-
-        # Initialize simulation
-        simulator.set_init_state(simulator.wp_init_vertices, simulator.wp_init_velocities)
-
-        # Collect initial state
-        object_points_sequence.append(wp.to_torch(simulator.wp_states[0].wp_x).detach().cpu().numpy())
-        controller_points_sequence.append(wp.to_torch(simulator.wp_states[0].wp_control_x).detach().cpu().numpy())
-        gt_object_points_sequence.append(mdata.object_point[0])
-
-        # Run simulation
-        logger.info(f"Running pure inference simulation for {mdata.train_frame} frames...")
-        for frame_idx in tqdm(range(1, cfg.train_frame)):
-            # Set controller target with pure_inference=True
-            simulator.set_controller_target(frame_idx, pure_inference=True)
-
-            if simulator.object_collision_flag:
-                simulator.update_collision_graph()
-
-            # Run simulation step
-            simulator.step()
-
-            # Collect data
-            object_points_sequence.append(wp.to_torch(simulator.wp_states[-1].wp_x).detach().cpu().numpy())
-            controller_points_sequence.append(wp.to_torch(simulator.wp_states[-1].wp_control_x).detach().cpu().numpy())
-            gt_object_points_sequence.append(mdata.object_point[frame_idx])
-
-            # Reset for next step
-            simulator.set_init_state(simulator.wp_states[-1].wp_x, simulator.wp_states[-1].wp_v)
-            if cfg.data_type == "real" and frame_idx > 1:
-                simulator.update_acc()
-                simulator.set_acc_count(True)
-
-        logger.info("Simulation completed. Creating PyVista visualization...")
-        # Start a virtual framebuffer (requires xvfb to be installed)
-        pv.start_xvfb()
-
-        # Create PyVista visualization
-        plotter = pv.Plotter(off_screen=True, window_size=[1920, 1080])
-        plotter.set_background('white')
-        # Set camera view
-        plotter.camera_position = 'xy'
-        plotter.camera.azimuth = 45
-        plotter.camera.elevation = 30
-
-        plotter.open_movie(output_video_path, framerate=30)
-        
-        # plotter.show(auto_close=False)  # 必须先 show，建立窗口上下文
-
-        # import pdb; pdb.set_trace()
-        # Visualize each frame
-        for frame_idx in tqdm(range(len(object_points_sequence)), desc="Rendering frames"):
-            plotter.clear()
-
-            # Add simulated object points (green)
-            obj_points = object_points_sequence[frame_idx]
-            if len(obj_points) > 0:
-                obj_cloud = pv.PolyData(obj_points)
-                plotter.add_mesh(obj_cloud, color='green', point_size=8.0,
-                                render_points_as_spheres=True, label='Simulated Object')
-
-            # Add controller points (blue)
-            ctrl_points = controller_points_sequence[frame_idx]
-            if len(ctrl_points) > 0:
-                ctrl_cloud = pv.PolyData(ctrl_points)
-                plotter.add_mesh(ctrl_cloud, color='blue', point_size=10.0,
-                                render_points_as_spheres=True, label='Controller')
-
-            # Add ground truth object points (red, semi-transparent)
-            gt_points = gt_object_points_sequence[frame_idx]
-            if len(gt_points) > 0:
-                gt_cloud = pv.PolyData(gt_points)
-                plotter.add_mesh(gt_cloud, color='red', point_size=6.0,
-                                opacity=0.5, render_points_as_spheres=True,
-                                label='Ground Truth')
-
-            # Add legend and text
-            plotter.add_text(f'Frame: {frame_idx}/{len(object_points_sequence)-1}',
-                            position='upper_left', font_size=12, color='black')
-
-            # Write frame
-            plotter.write_frame()
-
-        plotter.close()
-        logger.info(f"Video saved to: {output_video_path}")
-
-        logger.info("Visualization complete!")
-
-        return object_points_sequence, controller_points_sequence, gt_object_points_sequence

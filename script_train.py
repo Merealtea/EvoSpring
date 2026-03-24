@@ -32,24 +32,28 @@ if not os.path.exists(base_path):
 dir_names = os.listdir(base_path)
 finished_cases = os.listdir(res_path)
 
+
 for idx, case_name in enumerate(dir_names):
-    case_name = 'double_lift_cloth_3' # DEBUG
+    if 'cloth' in case_name or 'package' in case_name:
+        # pass this right now
 
-    print(f"Running case: {case_name}")
-    # if case_name in finished_cases:
-    #     print(f"Case {case_name} already finished, skipping.")
-    #     continue
+        # case_name = 'single_lift_zebra' # DEBUG
 
-    os.system(
-        f"python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
-            -case {case} -space_dim {config['space_dim']} -local_rank {local_rank} \
-            -n_train {config['n_train']} -n_valid {config['n_valid']} -n_test {config['n_test']} -time_len {config['time_len']} \
-            -noise_level {config['noise_level']} \
-            -multi_mesh_layer {config['multi_mesh_layer']} -consist_mesh {config['consist_mesh']} \
-            -num_epochs {config['num_epochs']} -batch {config['batch']} -lr {config['lr']} -gamma {config['gamma']} \
-            -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
-            -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
-    )
+        print(f"Running case: {case_name}")
+        # if case_name in finished_cases:
+        #     print(f"Case {case_name} already finished, skipping.")
+        #     continue
+
+        os.system(
+            f"python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
+                -case {case} -space_dim {config['space_dim']} -local_rank {local_rank} \
+                -n_train {config['n_train']} -n_valid {config['n_valid']} -n_test {config['n_test']} -time_len {config['time_len']} \
+                -noise_level {config['noise_level']} \
+                -multi_mesh_layer {config['multi_mesh_layer']} -consist_mesh {config['consist_mesh']} \
+                -num_epochs {config['num_epochs']} -batch {config['batch']} -lr {config['lr']} -gamma {config['gamma']} \
+                -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
+                -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name}"
+        )
 
     # if idx == 5: 
     break

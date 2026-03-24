@@ -420,37 +420,9 @@ class End2End(EvoMesh):
             node_in = node_in + down_outs[up_idx]
 
         edge_embedding = edge_embedding + ds_edge_embedding[0]
-        # add transformer layer for node_in
-        # node_in shape: (T, N, latent_dim)
-        T, N, _ = node_in.shape
-
-        # 1. 提取当前尺度的 pos 并生成 Positional Encoding
-        current_pos = down_ps[0].squeeze(0) if down_ps[0].dim() == 4 else down_ps[0] 
-        pos_enc = self.pos_encoder(current_pos) # shape: (T, N, ld)
-
-        # 2. 显存优化的 Mask 处理：不使用 repeat，直接利用广播机制
-        non_connection_node = torch.where(attn_mask.sum(dim=0) == attn_mask.shape[0])[0]
-        attn_mask[non_connection_node, non_connection_node] = False
-        
-        # PyTorch 原生 MHA 需要 Float 格式的 Mask: 0.0 表示保留计算，-inf 表示断开连接
-        float_mask = torch.zeros_like(attn_mask, dtype=torch.float)
-        float_mask[~attn_mask] = float('-inf')
-
-        # 3. 传入重构后的 Transformer (自动将 pos_enc 分配给 Q 和 K)
-        # 注意这里不再需要繁琐的 permute，因为上面我们在类内部已经开启了 batch_first=True
-        node_in_transformed = self.transformer_encoder(node_in, pos_enc, attn_mask=float_mask)
-        
-        node_in = node_in_transformed + node_in  # residual connection
-        src_idx, tgt_idx = m_gs[0]
-        src_node = node_in[:, src_idx]
-        tgt_node = node_in[:, tgt_idx]
-
-        edge_weight_feat = self.edge_weight(torch.cat([src_node, tgt_node], dim = -1))
-        num_edge = len(src_idx)
-        
+        num_edge = edge_embedding.shape[1]
         # Average symmetric edges
         edge_feature = edge_embedding[:, :num_edge//2] + edge_embedding[:, num_edge//2:]
-        edge_weight_feat = edge_weight_feat[:, :num_edge//2] + edge_weight_feat[:, num_edge//2:]
 
         # print(num_nodes_list)
-        return edge_weight_feat, edge_feature
+        return edge_feature
