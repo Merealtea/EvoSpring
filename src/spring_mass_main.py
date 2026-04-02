@@ -102,6 +102,9 @@ if __name__ == "__main__":
     elif args.case == 'End2End':
         from End2End_trainer import E2ETrainer
         trainer = E2ETrainer(args, device)
+    elif args.case == 'End2End_Reduction':
+        from End2End_Reduction_trainer import E2EReductionTrainer
+        trainer = E2EReductionTrainer(args, device)
     
     if MODE(args.mode) == MODE.Train:
         print('Train')

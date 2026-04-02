@@ -13,7 +13,7 @@ import sys
 from qqtt.model.diff_simulator import SpringMassSystemWarp
 import open3d as o3d
 
-class End2EndDataset(MeshGeneralDataset):
+class End2EndReductionDataset(MeshGeneralDataset):
     def __init__(self, root, layer_num, stride, mode='train',
                  refine_steps=[], recal_mesh=False, consist_mesh=False, 
                  object_case=None, args=None, device = None, mask_path = None,
@@ -136,70 +136,14 @@ class End2EndDataset(MeshGeneralDataset):
             controller_max_neighbours=cfg.controller_max_neighbours,
             mask=self.init_masks,
         )
-
-        # Initialize parameters from cfg
-        self.simulator = SpringMassSystemWarp(
-            self.init_vertices,
-            self.init_springs,
-            self.init_rest_lengths,
-            self.init_masses,
-            dt=cfg.dt,
-            num_substeps=cfg.num_substeps,
-            spring_Y=cfg.init_spring_Y,
-            collide_elas=cfg.collide_elas,
-            collide_fric=cfg.collide_fric,
-            dashpot_damping=cfg.dashpot_damping,
-            drag_damping=cfg.drag_damping,
-            collide_object_elas=cfg.collide_object_elas,
-            collide_object_fric=cfg.collide_object_fric,
-            init_masks=self.init_masks,
-            collision_dist=cfg.collision_dist,
-            init_velocities=self.init_velocities,
-            num_object_points=self.num_all_points,
-            num_surface_points=self.num_surface_points,
-            num_original_points=self.num_original_points,
-            controller_points=self.controller_points,
-            reverse_z=cfg.reverse_z,
-            spring_Y_min=cfg.spring_Y_min,
-            spring_Y_max=cfg.spring_Y_max,
-            gt_object_points=self.object_points,
-            gt_object_visibilities=self.object_visibilities,
-            gt_object_motions_valid=self.object_motions_valid,
-            self_collision=cfg.self_collision,
-        )
         
         # Use data from _init_start and simulator initialization
-        # mesh_pos: all initial points (object + controller)
-        self.mesh_pos = self.init_vertices.cpu().numpy()
 
         # cells: spring connectivity topology
         self.cells = self.init_springs.cpu().numpy().T
 
-        # 根据这个cells信息，构建一个对应的attn_mask，即两个点之间有边相连的才作为1，否则就设为0
-        num_nodes = len(self.mesh_pos)
-        attn_mask = np.zeros((num_nodes, num_nodes), dtype=bool)
-        # cells的每一行是[node_i, node_j]，表示这两个节点之间有边相连
-        for edge in self.cells.T:
-            i, j = edge[0], edge[1]
-            attn_mask[i, j] = True
-            attn_mask[j, i] = True  # 无向图，双向设置
-        self.attn_mask = ~torch.BoolTensor(attn_mask).to(cfg.device)
-
-        # spring parameters
-        self.spring_rest_length = self.init_rest_lengths.cpu().numpy()
-        self.init_spring_Y = cfg.init_spring_Y
-
-        # masses: set controller point masses to 0
-        self.masses = self.init_masses.cpu().numpy()
-        if self.controller_points is not None:
-            num_object_points = self.num_all_points
-            self.masses[num_object_points:] = 0.0
-
-        # velocities: initialize all to zero
-        self.velocity = np.zeros_like(self.mesh_pos)
-
         # node_type: 0=object, 1=surface, 2=inner, 3=controller
-        num_points = len(self.mesh_pos)
+        num_points = len(self.init_vertices)
         self.node_type = np.zeros((1, num_points, 1), dtype=np.int32)
 
         if self.num_original_points is not None:
@@ -215,38 +159,6 @@ class End2EndDataset(MeshGeneralDataset):
         if self.controller_points is not None:
             self.node_type[0, self.num_all_points:, 0] = 3
 
-        # object_point corresponds to wp_object_points in warp model
-        self.object_point = self.object_points
-        self.controller_point = self.controller_points
-
-        # Parameters from cfg (already initialized in simulator)
-        self.dt = cfg.dt
-        self.drag_damping = cfg.drag_damping
-        self.collide_object_elas = cfg.collide_object_elas
-        self.collide_object_fric = cfg.collide_object_fric
-        self.collide_elas = cfg.collide_elas
-        self.collide_fric = cfg.collide_fric
-        self.collision_dist = cfg.collision_dist
-        self.dashpot_damping = cfg.dashpot_damping
-        self.spring_Y_max = cfg.spring_Y_max
-        self.spring_Y_min = cfg.spring_Y_min
-        self.object_radius = cfg.object_radius
-        self.controller_radius = cfg.controller_radius
-        self.max_radius = max(self.object_radius, self.controller_radius)
-
-        # Use fields dict for compatibility with existing code
-        fields = {
-            'mesh_pos': torch.tensor(self.mesh_pos[None, :, :], dtype=torch.float),
-            'cells': self.cells.T[None, :, :]
-        }
-
-        self.stride = stride
-        self.strided_idx = list(range(0, fields["mesh_pos"].shape[0], stride))
-        self.L = len(self.strided_idx) - 1
-
-        self._cal_multi_mesh()
-        super(MeshGeneralDataset,self).__init__(root)
-        self.L = self.L - 1
 
     def _init_start(
         self,
@@ -376,150 +288,50 @@ class End2EndDataset(MeshGeneralDataset):
     def denormalize(self, value, min, max):
         assert min < max, "The minimum value should be less than the maximum value"
         return value * (max - min) + min
-
-    def get(self, idx):
-        # idx in time seq (enhanced by noise shuffle)
-        # also return the midx and mgs, for combining
-        if self.condition_steps > 0:
-            condition_feat = self.in_feature[idx: idx+self.condition_steps]
-            condition_feat = condition_feat.transpose(0, 1)
-        else:
-            condition_feat = self.in_feature[idx]
-            condition_edge_feat = self.edge_mech_feature[idx]
-
-        if self.prediction_steps > 0:
-            prediction_feat = self.tar_feature[idx+self.condition_steps: idx+self.condition_steps+self.prediction_steps]
-            prediction_feat = prediction_feat.transpose(0, 1)
-        else:
-            prediction_feat = self.tar_feature[idx+self.condition_steps]
-        if self.condition_steps > 0:
-            t = torch.arange(idx, idx+self.condition_steps) / (self.L + 1)
-            data = Data(x=condition_feat, y=prediction_feat, t=t)
-        else:
-            data = Data(x=condition_feat, edge_mech=condition_edge_feat, y=prediction_feat, t=idx)
-        return data
-
-    def _cal_multi_mesh(self):
-        if not self.has_contact:
-            if self.consist_mesh:
-                mmfile = os.path.join(self.data_dir, '_e2e_mmesh_layer_' + str(self.layer_num) + '.dat')
-            else:
-                mmfile = os.path.join(self.data_dir, self.object_case + '_e2e_mmesh_layer_' + str(self.layer_num) + '.dat')
-            mmexist = os.path.isfile(mmfile)
-
-            if self.recal_mesh or not mmexist:
-                if self.mesh_type == MeshType.Triangle:
-                    edge_i = triangles_to_edges(self.cells)
-                if self.mesh_type == MeshType.Tetrahedron:
-                    edge_i = tetras_to_edges(self.cells)
-                if self.mesh_type == MeshType.Quad:
-                    edge_i = quads_to_edges(self.cells)
-                if self.mesh_type == MeshType.Line:
-                    edge_i = lines_to_edges(self.cells)
-                if self.mesh_type == MeshType.Flat:
-                    edge_i = self.cells
-
-                m_gs, m_ids, m_edge_parents = generate_multi_layer_stride(edge_i,
-                                                        self.layer_num,
-                                                        seed_heuristic=self.seed_heuristic,
-                                                        n=self.mesh_pos.shape[0],
-                                                        pos_mesh=self.mesh_pos)
-                m_mesh = {'m_gs': m_gs, 'm_ids': m_ids, 'm_edge_parents': m_edge_parents}
-                pickle.dump(m_mesh, open(mmfile, 'wb'))
-
-            else:
-                m_mesh = pickle.load(open(mmfile, 'rb'))
-                m_gs, m_ids = m_mesh['m_gs'], m_mesh['m_ids']
-                m_edge_parents = m_mesh.get('m_edge_parents', None)  # Handle old pickle files without edge parents
-            self.m_g = m_gs
-            self.m_idx = m_ids
-            self.m_edge_parents = m_edge_parents
-        else:
-            raise NotImplementedError("Contact mesh generation is not implemented yet")
-
-        self.recal_mesh = False
-        return 
-
-    def _normalize(self, node_pos, edge_spring, spring_rest_length):
-        device = node_pos.device
-        node_pos = node_pos.clone()
-
-        node_pos[..., :self.in_norm_l] = (node_pos[..., :self.in_norm_l] - self.mean_in[None, :self.in_norm_l].to(device)) / self.std_in[None, :self.in_norm_l].to(device)
-        edge_spring = (torch.exp(edge_spring) - self.spring_Y_min) / (self.spring_Y_max - self.spring_Y_min)
-
-        spring_rest_length = spring_rest_length / self.max_radius
-
-        return node_pos, edge_spring, spring_rest_length
     
-    def _denormalize(self, node_pos, edge_spring, spring_rest_length):
-        device = node_pos.device
-        node_pos = node_pos.clone()
+    def create_spring_mass_sim(self,
+                               init_vertices,
+                               init_springs,
+                               init_rest_lengths,
+                               init_masses,
+                               node_type,
+                               gt_object_points,
+                               gt_object_visibilities,
+                               gt_object_motions_valid,
+                               ):
+        num_original_points = sum(node_type==0).item()
+        num_surface_points = num_original_points + sum(node_type==1).item() 
+        num_all_points = num_surface_points + sum(node_type==2).item()
 
-        node_pos[..., :self.out_norm_l] = node_pos[..., :self.out_norm_l] * self.std_out.to(device) + self.mean_out.to(device)
-        edge_spring = edge_spring * (self.spring_Y_max - self.spring_Y_min) + self.spring_Y_min
+        # Initialize parameters from cfg
+        simulator = SpringMassSystemWarp(
+            init_vertices,
+            init_springs,
+            init_rest_lengths,
+            init_masses,
+            dt=cfg.dt,
+            num_substeps=cfg.num_substeps,
+            spring_Y=cfg.init_spring_Y,
+            collide_elas=cfg.collide_elas,
+            collide_fric=cfg.collide_fric,
+            dashpot_damping=cfg.dashpot_damping,
+            drag_damping=cfg.drag_damping,
+            collide_object_elas=cfg.collide_object_elas,
+            collide_object_fric=cfg.collide_object_fric,
+            init_masks=self.init_masks,
+            collision_dist=cfg.collision_dist,
+            init_velocities=torch.zeros_like(init_vertices),
+            num_object_points=num_all_points,
+            num_surface_points=num_surface_points,
+            num_original_points=num_original_points,
+            controller_points=self.controller_points,
+            reverse_z=cfg.reverse_z,
+            spring_Y_min=cfg.spring_Y_min,
+            spring_Y_max=cfg.spring_Y_max,
+            gt_object_points=gt_object_points,
+            gt_object_visibilities=gt_object_visibilities,
+            gt_object_motions_valid=gt_object_motions_valid,
+            self_collision=cfg.self_collision,
+        )
         
-        spring_rest_length = spring_rest_length * self.max_radius
-        return node_pos, edge_spring, spring_rest_length
-
-    def _preprocess(self, node_pos, node_vel, node_mass, 
-                    log_spring_Y, spring_rest_length, 
-                    drag_damping, 
-                    spring_force, dashpot_force, overall_forces, 
-                    device, mode='train'):
-        T, num_node, geo_dim = node_pos.shape
-
-        # normalization for node_pos 和 log_spring_Y, spring_rest_length
-        # TODO : add normalization for edge features
-
-        node_pos, spring_Y, spring_rest_length = self._normalize(node_pos, 
-                                                       log_spring_Y, 
-                                                       spring_rest_length)
-
-        # recalculate it for surface and interior nodes later
-        node_damping = (node_vel * drag_damping).clone()
-
-        # node_type : 0 object point, 1 surface point, 2 interior point, 3 controller point
-        node_type = torch.LongTensor(self.node_type).to(node_pos.device)
-
-        # concat historical position and velocity of every node together as input, and the target is the next step position, velocity is optional to predict
-        node_info = torch.cat((node_pos, node_vel, node_damping), dim=-1)
-        
-        node_info_his = node_info[:-1]
-        node_info_tar = node_info[1:]
-
-        node_inp_info = torch.cat([node_info_his, node_info_tar], dim=-1)
-     
-        node_mass = node_mass[None, :, None].repeat(T-1, 1, 1)
-        node_type = node_type.repeat(T-1, 1, 1)
-
-        # [node_pos, node_vel] * T, node_ 12:13 node_mass 13:16 node_damping, 16: type
-        node_inp_info = torch.cat((node_inp_info, node_mass, node_type), dim=-1)
-
-        # concat spring_Y, spring_rest_length, dashpot_damping as edge features, and repeat for both directions
-        edge_in_info = torch.cat((spring_force, dashpot_force), dim=-1)[:-1]
-
-        spring_Y = spring_Y[None, :].repeat(T-1, 1, 1)
-        spring_rest_length = spring_rest_length[None, :].repeat(T-1, 1, 1)
-        # spring_dashpot_damping = torch.ones_like(spring_Y) * self.dashpot_damping  
-        
-        edge_in_info = torch.cat((edge_in_info, spring_Y, spring_rest_length), dim = -1)
-
-        # enhance by noise level
-        if self.noise_shuffle:
-            # collect special nodes
-            no_noise_node = (node_type == 3).bool() # dont add noise to controller nodes
-            noise_base = torch.ones_like(node_info_tar)
-            noise_base[:, :] = self.noise_level
-            noise = torch.normal(0.0, noise_base)
-
-            # for dirichelet nodes, the noise is zero
-            noise = torch.where(no_noise_node, torch.zeros_like(noise), noise)
-            node_inp_info += noise
-            node_info_tar += (1.0 - self.noise_gamma) * noise
-
-        # Load data to GPU
-        node_inp_info = node_inp_info.to(device)
-        edge_in_info = edge_in_info.to(device)
-
-        # Input, and target, but in our case, we have to targets, one for node position and velocity, another egde prediction
-        return node_inp_info, edge_in_info
+        return simulator

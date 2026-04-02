@@ -328,7 +328,7 @@ if __name__ == "__main__":
     output_dir = './evomesh_optimization_outputs'
     os.makedirs(output_dir, exist_ok=True)
     for obj_case in object_cases:
-        object_cases = 'double_stretch_sloth'
+        object_cases = 'single_lift_cloth_4'
         opt_file = os.path.join(opt_file_path, obj_case, "final_data.pkl")
         params_file = os.path.join(param_file_path, obj_case, "optimal_params.pkl")
         split_file = os.path.join(opt_file_path, obj_case, "split.json")

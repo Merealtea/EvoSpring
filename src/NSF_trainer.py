@@ -442,7 +442,7 @@ class NSFTrainer:
         spring_Y = wp.to_torch(simulator.wp_spring_Y).clone()
 
         spring_rest_length = wp.to_torch(simulator.wp_rest_lengths).clone()
-        spring_dashpot_damping = simulator.dashpot_damping
+        spring_dashpot_damping = simulator.wp_dashpot_damping
         drag_damping = simulator.drag_damping
 
         if enable_backward:

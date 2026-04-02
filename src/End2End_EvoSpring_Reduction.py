@@ -1,7 +1,7 @@
 from models import ModelGeneral
 import torch
 from torch_geometric.utils import degree
-from End2End_core_model import End2End
+from End2End_reduction_model import End2EndReduction
 from core_model import MLP, gumbel_softmax
 from qqtt.model.diff_simulator import (
     SpringMassSystemWarp,
@@ -32,11 +32,11 @@ class FourierFeatureTransform(torch.nn.Module):
             out.append(torch.cos(x * freq))
         return torch.cat(out, dim=-1)
 
-class End2End_EvoSpring(ModelGeneral):
+class End2EndReduction_EvoSpring(ModelGeneral):
     def __init__(self, pos_dim, ld, layer_num, pre_layer_num, bottom_layer_num, mlp_hidden_layer, MP_times, enhance, agg_conv_pos, default_spring_Y, default_drag_damping=None, default_dashpot_damping=None, default_collision_elas=None, default_collision_fric=None, default_collision_object_elas=None, default_collision_object_fric=None):
         # in: d_x(used for driven nodes only),type
         # out: d_x
-        in_dim = 60 # init_pos, node_mass, node_damping, node_type, pos_encoding
+        in_dim = 3 + 1 + 1 + 60# init_pos, node_mass, node_damping, node_type, pos_encoding
   
         self.lagrangian = False
         super(ModelGeneral, self).__init__()
@@ -46,12 +46,10 @@ class End2End_EvoSpring(ModelGeneral):
         
         # layer_num = 1
         # pre_layer_num = 1
-        self.process = End2End(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim,
+        self.process = End2EndReduction(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim,
                                     self.lagrangian, enhance, agg_conv_pos, edge_set_num)
 
         self.edge_decode = MLP(ld, ld, 1, 3, False)
-        # Edge selection MLP: predicts logits for keeping/discarding each edge
-        self.edge_selector = MLP(ld, ld, 2, 3, False)
 
         # Node type embedding: 4 types (0: object, 1: surface, 2: interior, 3: controller)
         self.node_type_embedding = torch.nn.Embedding(4, ld)
@@ -69,18 +67,14 @@ class End2End_EvoSpring(ModelGeneral):
         # Store default collision values
         self.collision_elas_0 = float(default_collision_elas) if default_collision_elas is not None else 0.5
         self.collision_fric_0 = float(default_collision_fric) if default_collision_fric is not None else 0.5
-        self.collision_object_elas_0 = float(default_collision_object_elas) if default_collision_object_elas is not None else 0.7
-        self.collision_object_fric_0 = float(default_collision_object_fric) if default_collision_object_fric is not None else 0.3
+        # self.collision_object_elas_0 = float(default_collision_object_elas) if default_collision_object_elas is not None else 0.7
+        # self.collision_object_fric_0 = float(default_collision_object_fric) if default_collision_object_fric is not None else 0.3
 
-        # Learnable damping bias parameters (initialized to 0)
-        self.drag_damping_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
-        self.dashpot_damping_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
-
-        # Learnable collision bias parameters (initialized to 0)
-        self.collision_elas_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
-        self.collision_fric_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
-        self.collision_object_elas_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
-        self.collision_object_fric_bias = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
+        # --- 新增的四个参数 Decoders ---
+        self.drag_damping_decode = MLP(ld*2, ld, 1, 3, False)
+        self.dashpot_damping_decode = MLP(ld*2, ld, 1, 3, False)
+        self.collision_elas_decode = MLP(ld*2, ld, 1, 3, False)
+        self.collision_fric_decode = MLP(ld*2, ld, 1, 3, False)
 
     def load_warp_simulator(self, simulator):
         self.simulator = simulator
@@ -94,11 +88,13 @@ class End2End_EvoSpring(ModelGeneral):
 
     def _get_pos_type(self, node_in):
         # 0:3 current_pos, 3:6 next_pos 6:9 mesh_pos, 9:12 node_vel 12:13 node_mass 13:16 node_damping, 16: type
-        pos_mat_world = node_in[..., :self.pos_dim] 
+        pos_mat_world = node_in[..., :self.pos_dim].clone() 
+
+        node_mass = node_in[..., -2:-1].clone()
 
         # torch.cat((node_in[..., self.pos_dim:2 * self.pos_dim], node_in[..., :self.pos_dim]), dim=-1)
         node_type = node_in[..., -1].clone()
-        return pos_mat_world, node_type
+        return pos_mat_world, node_mass, node_type
 
     def _get_vel(self, node_in):
         return node_in[..., self.pos_dim * 3 : self.pos_dim * 4]
@@ -123,23 +119,27 @@ class End2End_EvoSpring(ModelGeneral):
 
     def _get_nodal_latent_input(self, node_in):
         # in_dim for nodal encoding: [world, mesh_pos, node_mass, velocity, node_damping, type] out of [world, mesh_pos, node_mass, velocity, node_damping, type]
-        return node_in[:, :-4].clone()
+        return node_in
     
     def _get_mesh_pos(self, node_info):
-        return node_info[..., 2*self.pos_dim: 3*self.pos_dim].clone()
+        return node_info[..., : self.pos_dim].clone()
 
-    def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, node_type, attn_mask=None):
+    def _EMD(self, node_feature, m_ids, multi_gs, pos, node_mass, node_type):
         node_feature = self._get_nodal_latent_input(node_feature)
-
-        # TODO: Generate edge features for spring-mass system if needed
+     
         x = self.encode(node_feature)
        
         # Add node type embeddings
-        type_emb = self.node_type_embedding(node_type.long())
-        x = x + type_emb
-        edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, self.temp, attn_mask)
+        # type_emb = self.node_type_embedding(node_type.long())
+        # x = x + type_emb
+        mlvl_edge_feature, mlvl_masses, mlvl_node_type, mlvl_spring_graph, new_node_idx\
+              = self.process(x, m_ids, multi_gs, pos, node_mass, node_type, self.temp)
 
-        return edge_feature
+        mlvl_node_index = [new_node_idx[0]]
+        for i in range(1, len(new_node_idx)):
+            mlvl_node_index.append(np.array(mlvl_node_index[i-1])[new_node_idx[i]].tolist())
+
+        return mlvl_edge_feature, mlvl_masses, mlvl_node_type, mlvl_spring_graph, mlvl_node_index 
     
     def _enforce_min_degree(self, m_gs, edge_mask, num_nodes):
         """
@@ -188,27 +188,62 @@ class End2End_EvoSpring(ModelGeneral):
 
         return constrained_mask
     
-    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, attn_mask=None):
+    def forward(self, m_idx, m_gs, node_in):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
 
+        mlvl_s_out = []
+        mlvl_drag_damping_out = []
+        mlvl_dashpot_damping_out = []
+        mlvl_collide_elas_out = []
+        mlvl_collide_fric_out = []
+
         # get mat pos and type
-        node_pos, node_type = self._get_pos_type(node_in)
+        node_pos, node_mass, node_type = self._get_pos_type(node_in)
 
         # Process current frame through EMD
-        edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_type, attn_mask)
+        mlvl_edge_feature, mlvl_masses, mlvl_node_type, mlvl_spring_graph, mlvl_node_index \
+                = self._EMD(node_in, m_idx, m_gs, node_pos, node_mass, node_type)
 
-        edge_mech_in_bias = self.edge_decode(edge_feature)[0,:,0]  # Remove time dimension
+        for edge_feature in mlvl_edge_feature:
+            # predict edge_mech_bias
+            edge_mech_in_bias = self.edge_decode(edge_feature)[0,:,0]
+            s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
+            s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
+            mlvl_s_out.append(s_out)
 
-        print("edge bias min is {}, edge bias max is {}".format(edge_mech_in_bias.min(), edge_mech_in_bias.max()))
+            # 将 Mean 和 Max 拼接 (需要在 __init__ 中把 Decoder 的输入维度改为 2 * ld)
+            mean_feat = torch.mean(edge_feature, dim=1)
+            max_feat = torch.max(edge_feature, dim=1)[0]
+            global_feature = torch.cat([mean_feat, max_feat], dim=-1) # shape: [bs, 2 * C]
 
-        s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
-        s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
+            # 2. predict drag_damping bias
+            
+            drag_bias = self.drag_damping_decode(global_feature)[0] # 获取标量
+            drag_out = self.drag_damping_0 + drag_bias
+            # drag_out = torch.clip(drag_out, 1e-8, 100.0) 
+            mlvl_drag_damping_out.append(drag_out)
 
-        # # Return spring stiffness and damping parameters (default + learnable bias)
-        drag_damping_out = self.drag_damping_0 + self.drag_damping_bias * 0 # 100
-        dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias * 0 # 1000
+            # 3. predict dashpot_damping bias
+            dashpot_bias = self.dashpot_damping_decode(global_feature)[0]
+            dashpot_out = self.dashpot_damping_0 + dashpot_bias
+            # dashpot_out = torch.clip(dashpot_out, 1e-8, 100.0)
+            mlvl_dashpot_damping_out.append(dashpot_out)
 
-        return s_out, drag_damping_out, dashpot_damping_out
+            # 4. predict collision_elas bias (Restitution)
+            elas_bias = self.collision_elas_decode(global_feature)[0]
+            elas_out = self.collision_elas_0 + elas_bias * 0.001
+            elas_out = torch.clip(elas_out, 0.0, 1.0) 
+            mlvl_collide_elas_out.append(elas_out)
+
+            # 5. predict collision_fric bias (Friction)
+            fric_bias = self.collision_fric_decode(global_feature)[0]
+            fric_out = self.collision_fric_0 + fric_bias * 0.001
+            fric_out = torch.clip(fric_out, 0.0, 2.0) 
+            mlvl_collide_fric_out.append(fric_out)
+            
+        return mlvl_s_out, mlvl_drag_damping_out, mlvl_dashpot_damping_out, \
+            mlvl_collide_fric_out, mlvl_collide_elas_out, mlvl_masses, \
+                mlvl_spring_graph, mlvl_node_index, mlvl_node_type
     

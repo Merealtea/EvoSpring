@@ -307,6 +307,7 @@ class End2End(EvoMesh):
             #     gs, _ = add_remaining_self_loops(m_gs[i]) 
 
             gs = m_gs[i]
+
             multi_level_edge_mech_info.append(edge_mech_in)
 
             if i < self.pre_l_n:

@@ -10,12 +10,12 @@ vis_interval: 20
 init_spring_Y: 3e4
 collide_elas: 0.5
 collide_fric: 0.3
-collide_object_elas: 0.3
+collide_object_elas: 0.7
 collide_object_fric: 0.3
-object_radius: 0.02
-object_max_neighbours: 30
-controller_radius: 0.04
-controller_max_neighbours: 50
+object_radius: 0.05
+object_max_neighbours: 50
+controller_radius: 0.08
+controller_max_neighbours: 80
 spring_Y_min: 0
 spring_Y_max: 1e5
 reverse_z: true
@@ -26,4 +26,4 @@ collision_dist: 0.02
 collision_learn: true
 chamfer_weight: 1.0
 track_weight: 1.0
-self_collision: true
+self_collision: false # true

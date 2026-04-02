@@ -3,6 +3,28 @@ import numpy as np
 from qqtt.utils import logger, cfg
 import warp as wp
 
+# 兼容不同的 Warp 版本路径 (新版大多在 _src 目录下)
+try:
+    import warp._src.utils
+    warp_module = warp._src.utils
+except ImportError:
+    import warp.utils
+    warp_module = warp.utils
+
+# 1. 备份 Warp 原始的 warn 函数
+original_warn = warp_module.warn
+
+# 2. 伪造一个我们自己的 warn 函数
+def custom_warn(message, category=None, stacklevel=1, once=False):
+    # 如果发现是那个烦人的 tape 警告，直接 return 丢弃掉，当无事发生
+    if "Running the tape backwards" in str(message):
+        return  
+    # 其他的警告则乖乖放行，照常调用原始函数
+    original_warn(message, category, stacklevel, once)
+
+# 3. 狸猫换太子：强行把 Warp 内部的 warn 替换成我们自定义的函数
+warp_module.warn = custom_warn
+
 # wp.init()
 # wp.set_device("cuda:0")
 # if not cfg.use_graph:
@@ -25,14 +47,17 @@ class State:
         self.wp_control_v = wp.zeros_like(self.wp_control_x, requires_grad=False)
 
         # --- 新增：用于在 Kernel 中记录碰撞信息的 Buffer ---
-        num_object_points = wp_init_vertices.shape[0]
-        self.wp_hit_count = wp.zeros(num_object_points, dtype=wp.int32, requires_grad=False)
-        self.wp_hit_indices = wp.zeros((num_object_points, 100), dtype=wp.int32, requires_grad=False)
-        self.wp_hit_impulses = wp.zeros((num_object_points, 100), dtype=wp.vec3, requires_grad=False)
+        # num_object_points = wp_init_vertices.shape[0]
+        # self.wp_hit_count = wp.zeros(num_object_points, dtype=wp.int32, requires_grad=False)
+        # self.wp_hit_indices = wp.zeros((num_object_points, 100), dtype=wp.int32, requires_grad=False)
+        # self.wp_hit_impulses = wp.zeros((num_object_points, 100), dtype=wp.vec3, requires_grad=False)
 
     def clear_forces(self):
         self.wp_vertice_forces.zero_()
-        self.wp_hit_count.zero_()
+        # self.wp_hit_count.zero_()
+        # # --- 加上下面这两行，每次都把显存洗干净 ---
+        # self.wp_hit_indices.zero_()
+        # self.wp_hit_impulses.zero_()
 
     @property
     def requires_grad(self):
@@ -170,10 +195,11 @@ def loop(
     collision_dist: float,
     clamp_collide_object_elas: float,
     clamp_collide_object_fric: float,
-    # --- 新增参数 ---
-    hit_count: wp.array(dtype=wp.int32),
-    hit_indices: wp.array2d(dtype=wp.int32),
-    hit_impulses: wp.array2d(dtype=wp.vec3),
+    # # --- 新增参数 ---
+    # hit_count: wp.array(dtype=wp.int32),
+    # hit_indices: wp.array2d(dtype=wp.int32),
+    # hit_impulses: wp.array2d(dtype=wp.vec3),
+    sort_buffer: wp.array2d(dtype=wp.vec3), # 传入草稿纸
 ):
     x1 = x[i]
     v1 = v[i]
@@ -181,7 +207,9 @@ def loop(
     mask1 = masks[i]
 
     valid_count = float(0.0)
-    J_sum = wp.vec3(0.0, 0.0, 0.0)
+    idx = int(0)
+    current_hits = int(0)
+
     for k in range(collision_number[i]):
         index = collision_indices[i][k]
         x2 = x[index]
@@ -193,42 +221,77 @@ def loop(
         dis_len = wp.length(dis)
         relative_v = v2 - v1
         # If the distance is less than the collision distance and the two points are moving towards each other
+        # 碰撞条件保持不变
         if (
             mask1 != mask2
             and dis_len < collision_dist
             and wp.dot(dis, relative_v) < -1e-4
         ):
             valid_count += 1.0
+            mass_inv_sum = 1.0 / m1 + 1.0 / m2
 
-            collision_normal = dis / wp.max(dis_len, 1e-6)
+            # ==========================================
+            # 修复 1：几何奇点 (完全重叠导致法线随机化)
+            # ==========================================
+            if dis_len < 1e-6:
+                # 如果极度穿模，强制赋予一个 Z 轴向上的排斥法线，防止 NaN 或随机弹飞
+                collision_normal = wp.vec3(0.0, 0.0, 1.0)
+            else:
+                collision_normal = dis / dis_len
+
             v_rel_n = wp.dot(relative_v, collision_normal) * collision_normal
-            impulse_n = (-(1.0 + clamp_collide_object_elas) * v_rel_n) / (
-                1.0 / m1 + 1.0 / m2
-            )
             v_rel_n_length = wp.length(v_rel_n)
+            
+            # 法向冲量 (Normal Impulse)
+            impulse_n = (-(1.0 + clamp_collide_object_elas) * v_rel_n) / mass_inv_sum
 
+            # ==========================================
+            # 修复 2：摩擦力奇点 (切向速度极小导致除零溢出)
+            # ==========================================
             v_rel_t = relative_v - v_rel_n
-            v_rel_t_length = wp.max(wp.length(v_rel_t), 1e-6)
-            a = wp.max(
-                0.0,
-                1.0
-                - clamp_collide_object_fric
-                * (1.0 + clamp_collide_object_elas)
-                * v_rel_n_length
-                / v_rel_t_length,
-            )
-            impulse_t = (a - 1.0) * v_rel_t / (1.0 / m1 + 1.0 / m2)
+            v_rel_t_length = wp.length(v_rel_t)
+
+            if v_rel_t_length < 1e-6:
+                # 几乎没有切向滑动，处于静摩擦状态，直接施加反向冲量抵消全部切向速度
+                impulse_t = -v_rel_t / mass_inv_sum
+            else:
+                
+                # 动摩擦状态：安全计算摩擦力圆锥截断 (Friction Cone Clamping)
+                friction_limit = clamp_collide_object_fric * (1.0 + clamp_collide_object_elas) * v_rel_n_length
+                # ratio 代表我们需要抵消多少比例的切向速度，最大为 1.0 (完全停止滑动)
+                ratio = wp.min(friction_limit / v_rel_t_length, 1.0)
+                impulse_t = -ratio * v_rel_t / mass_inv_sum
 
             J = impulse_n + impulse_t
-            J_sum += J
 
-            # --- 新增：在这里直接将真实的碰撞 ID 和冲量写入显存 ---
-            current_hits = hit_count[i]
-            if current_hits < 100:  
-                hit_indices[i, current_hits] = index
-                hit_impulses[i, current_hits] = J
-                hit_count[i] = current_hits + 1
+            # # --- 新增：在这里直接将真实的碰撞 ID 和冲量写入显存 ---
+            # # current_hits = hit_count[i]
+            # if idx < 100:  
+            #     hit_indices[i, idx] = index
+            #     hit_impulses[i, idx] = J
+            #     idx += 1
+   
+            sort_buffer[i, current_hits] = J
+            current_hits += 1
 
+    # 2. 对草稿纸中的冲量进行插入排序 (按模长平方从小到大)
+    for step in range(1, current_hits):
+        key_J = sort_buffer[i, step]
+        key_mag = wp.length_sq(key_J)
+        
+        j = step - 1
+        while j >= 0 and wp.length_sq(sort_buffer[i, j]) > key_mag:
+            sort_buffer[i, j + 1] = sort_buffer[i, j]
+            j -= 1
+        
+        sort_buffer[i, j + 1] = key_J
+
+    # 3. 排序完成后，从最小的力开始累加，极大降低浮点数精度截断造成的误差
+    J_sum = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(current_hits):
+        J_sum += sort_buffer[i, k]
+
+    # hit_count[i] = int(idx)
     return valid_count, J_sum
 
 
@@ -274,15 +337,15 @@ def object_collision(
     collision_dist: float,
     collision_indices: wp.array2d(dtype=wp.int32),
     collision_number: wp.array(dtype=wp.int32),
-    # --- 新增参数 ---
-    hit_count: wp.array(dtype=wp.int32),
-    hit_indices: wp.array2d(dtype=wp.int32),
-    hit_impulses: wp.array2d(dtype=wp.vec3),
-    # --------------
+    # # --- 新增参数 ---
+    # hit_count: wp.array(dtype=wp.int32),
+    # hit_indices: wp.array2d(dtype=wp.int32),
+    # hit_impulses: wp.array2d(dtype=wp.vec3),
+    sort_buffer: wp.array2d(dtype=wp.vec3), # <--- 接收草稿纸
+    # # --------------
     v_new: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
-
     v1 = v[tid]
     m1 = masses[tid]
 
@@ -300,9 +363,10 @@ def object_collision(
         collision_dist,
         clamp_collide_object_elas,
         clamp_collide_object_fric,
-        hit_count,     # 传入
-        hit_indices,   # 传入
-        hit_impulses,  # 传入
+        # hit_count,     # 传入
+        # hit_indices,   # 传入
+        # hit_impulses,  # 传入
+        sort_buffer, # <--- 传给 loop
     )
 
     if valid_count > 0:
@@ -787,6 +851,13 @@ class SpringMassSystemWarp:
             requires_grad=cfg.collision_learn,
         )
 
+        # --- 新增：全局唯一的排序草稿纸，所有 substep 共用这一块显存 ---
+        self.wp_sort_buffer = wp.zeros(
+            (self.wp_init_vertices.shape[0], 500), 
+            dtype=wp.vec3, 
+            requires_grad=False
+        )
+
         # Create the CUDA graph to acclerate
         if cfg.use_graph:
             if cfg.data_type == "real":
@@ -1034,9 +1105,11 @@ class SpringMassSystemWarp:
                         self.wp_collision_indices,
                         self.wp_collision_number,
                         # --- 传入当前状态记录器 ---
-                        self.wp_states[i].wp_hit_count,
-                        self.wp_states[i].wp_hit_indices,
-                        self.wp_states[i].wp_hit_impulses,
+                        # self.wp_states[i].wp_hit_count,
+                        # self.wp_states[i].wp_hit_indices,
+                        # self.wp_states[i].wp_hit_impulses,
+
+                        self.wp_sort_buffer,  # <--- 修改这里：传入全局复用的草稿纸
                     ],
                     outputs=[self.wp_states[i].wp_v_before_ground],
                 )
@@ -1253,44 +1326,55 @@ class SpringMassSystemWarp:
         masks = self.wp_masks.numpy()
         record_limit = min(self.num_object_points, max_points)
 
+        max_record = 5
+        first_hit_node = None
         with open(filename, "a", encoding="utf-8") as f:
             f.write(f"========== Frame {frame_idx} ==========\n")
 
             for i in range(self.num_substeps):
-                substep_has_collision = False
-                if i > 95 and i < 100:
+                if (self.wp_states[i].wp_hit_count.numpy().max() > 2) and (max_record  > 0):
+                    if first_hit_node is None:
+                        first_hit_node = self.wp_states[i].wp_hit_count.numpy().argmax()
+                    max_record -= 1
                     # 直接拉取 Kernel 里记录的精准碰撞数据
                     hit_count = self.wp_states[i].wp_hit_count.numpy()
                     hit_indices = self.wp_states[i].wp_hit_indices.numpy()
+                    
                     hit_impulses = self.wp_states[i].wp_hit_impulses.numpy()
                     pos = self.wp_states[i].wp_x.numpy()
 
+                    # --- 新增：拉取 wp_v_before_ground 数据 ---
+                    v_bg = self.wp_states[i].wp_v_before_ground.numpy()
+                    
                     substep_logs = []
 
-                    for p in range(record_limit):
-                        count = hit_count[p]
-                        if count > 0:
-                            substep_has_collision = True
-                            p_pos = pos[p]
-                            p_mask = masks[p]
-                            m1 = masses[p]
+                    # for p in range(record_limit):
+                    p = first_hit_node
+                    count = hit_count[p]
+                    p_pos = pos[p]
+                    p_mask = masks[p]
+                    m1 = masses[p]
+                    p_v_bg = v_bg[p]  # 获取当前粒子的 v_before_ground
+                    # 1. 首先记录当前粒子的基础状态信息
+                    log_str = (f"    Particle {p:04d} [Mask:{p_mask}] | "
+                                f"Pos: ({p_pos[0]:6.3f}, {p_pos[1]:6.3f}, {p_pos[2]:6.3f}) | "
+                                f"V_before_ground: ({p_v_bg[0]:8.4f}, {p_v_bg[1]:8.4f}, {p_v_bg[2]:8.4f})\n")
+                    substep_logs.append(log_str)
 
-                            for k in range(count):
-                                target_id = hit_indices[p, k]
-                                # Kernel 里算的是冲量 J，根据 F = J / (m * dt) 还原出真实的力
-                                # 注意：v_new = v - (J_avg / m), 物理学上冲量作用在当前粒子上的效果是 -J / (m * dt)
-                                J = hit_impulses[p, k]
-                                force = -J / (m1 * self.dt)
-                                force_mag = np.linalg.norm(force)
+                    for k in range(count):
+                        target_id = hit_indices[p, k]
+                        # Kernel 里算的是冲量 J，根据 F = J / (m * dt) 还原出真实的力
+                        # 注意：v_new = v - (J_avg / m), 物理学上冲量作用在当前粒子上的效果是 -J / (m * dt)
+                        J = hit_impulses[p, k]
+                        
 
-                                log_str = (f"    Particle {p:04d} [Mask:{p_mask}] "
-                                        f"Hit -> Particle {target_id:04d} | "
-                                        f"Pos: ({p_pos[0]:6.3f}, {p_pos[1]:6.3f}, {p_pos[2]:6.3f}) | "
-                                        f"Force applied: ({force[0]:8.4f}, {force[1]:8.4f}, {force[2]:8.4f}) | "
-                                        f"Mag: {force_mag:8.4f}\n")
-                                substep_logs.append(log_str)
-                
-                if substep_has_collision:
+                        log_str = (f"    Particle {p:04d} [Mask:{p_mask}] "
+                                f"Hit -> Particle {target_id:04d} | "
+                                f"Pos: ({p_pos[0]:6.3f}, {p_pos[1]:6.3f}, {p_pos[2]:6.3f}) | "
+                                f"Impulse applied: ({J[0]:8.4f}, {J[1]:8.4f}, {J[2]:8.4f}) | \n")
+                        substep_logs.append(log_str)
+        
+
                     f.write(f"  --- Substep {i} ---\n")
                     f.writelines(substep_logs)
             f.write("\n")

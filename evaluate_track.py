@@ -5,7 +5,7 @@ import json
 import numpy as np
 from scipy.spatial import KDTree
 
-method_case_name = 'End2End' # 'neural_spring_field'  # 'evospring' # 'End2End'
+method_case_name = 'End2End_Reduction' # 'neural_spring_field'  # 'evospring' # 'End2End' # End2End_Reduction
 prediction_path = f"./res/{method_case_name}/"
 base_path = "./data/different_types/"
 output_file = "results/final_track.csv"

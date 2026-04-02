@@ -67,7 +67,7 @@ class E2ETrainer:
 
         self.default_spring_Y = wp.to_torch(self.model.module.simulator.wp_spring_Y).detach().clone()
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr * min(np.sqrt(cfg.train_frame), 1), betas=(0.9, 0.99))
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr * min(np.sqrt(cfg.train_frame), 5), betas=(0.9, 0.99))
         # max lr change to 5 for non cloth case
 
         self.collide_optimizer = torch.optim.Adam(warp_params_list,
@@ -369,6 +369,7 @@ class E2ETrainer:
         m_ids = mdata.m_idx
         m_gs_list = mdata.m_g
         m_gs_parents_list = mdata.m_edge_parents
+        
         m_gs = [torch.tensor(g, dtype=torch.long).to(cfg.device) for g in m_gs_list]
         m_gs_parents = [torch.tensor(g_parent, dtype=torch.long).to(cfg.device) for g_parent in m_gs_parents_list]
         
@@ -434,8 +435,8 @@ class E2ETrainer:
                         self.model.module.simulator.step()
                         self.model.module.simulator.calculate_simple_loss()
                     self.model.module.simulator.tape.backward(self.model.module.simulator.loss)
-            self.model.module.simulator.export_forces_to_txt(frame_idx=frame_idx, filename="simulation_forces.txt")
-            import pdb; pdb.set_trace()
+            # self.model.module.simulator.export_forces_to_txt(frame_idx=frame_idx, filename="simulation_forces.txt")
+            # import pdb; pdb.set_trace()
             valid_frames += 1
 
             # 提取所有可微分参数的梯度
@@ -668,7 +669,7 @@ class E2ETrainer:
                     update_frame_num=cfg.train_frame,
                     enable_backward=True,
                 )
-
+                
                 self.total_update += 1
 
                 # Print spring_Y average
@@ -694,7 +695,7 @@ class E2ETrainer:
                 print(f"Valid frames: {valid_frames}")
                 print(f"{'='*60}\n")
 
-
+                # import pdb; pdb.set_trace()
                 self.writer.add_scalar('Spring_Y_update/overall_Loss', np.sum(loss_val), self.total_update)
                 self.writer.add_scalar('Spring_Y_update/chamfer_Loss', np.sum(chamfer_loss_val), self.total_update)
                 self.writer.add_scalar('Spring_Y_update/track_Loss', np.sum(track_loss_val), self.total_update)
