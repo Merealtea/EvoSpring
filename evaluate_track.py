@@ -5,7 +5,7 @@ import json
 import numpy as np
 from scipy.spatial import KDTree
 
-method_case_name = 'End2End_Reduction' # 'neural_spring_field'  # 'evospring' # 'End2End' # End2End_Reduction
+method_case_name = 'End2End' # 'neural_spring_field'  # 'evospring' # 'End2End' # End2End_Reduction
 prediction_path = f"./res/{method_case_name}/"
 base_path = "./data/different_types/"
 output_file = "results/final_track.csv"
@@ -50,8 +50,13 @@ for dir_name in dir_names:
     train_frame = split["train"][1]
     test_frame = split["test"][1]
 
-    with open(f"{prediction_path}/{case_name}/trajectories/best_trajectory.pkl", "rb") as f:
-        vertices = pickle.load(f)['vertices']
+    # Read the trajectory data
+    if method_case_name == 'End2End_Reduction':
+        with open(f"{dir_name}/trajectories/stage_0_best_trajectory.pkl", "rb") as f:
+            vertices = pickle.load(f)['vertices']
+    else:
+        with open(f"{dir_name}/trajectories/best_trajectory.pkl", "rb") as f:
+            vertices = pickle.load(f)['vertices']
 
     with open(f"{base_path}/{case_name}/gt_track_3d.pkl", "rb") as f:
         gt_track_3d = pickle.load(f)

@@ -86,8 +86,12 @@ if __name__ == "__main__":
         print(f"Processing {case_name}")
 
         # Read the trajectory data
-        with open(f"{dir_name}/trajectories/best_trajectory.pkl", "rb") as f:
-            vertices = pickle.load(f)['vertices']
+        if method_case_name == 'End2End_Reduction':
+            with open(f"{dir_name}/trajectories/stage_0_best_trajectory.pkl", "rb") as f:
+                vertices = pickle.load(f)['vertices'][0]
+        else:
+            with open(f"{dir_name}/trajectories/best_trajectory.pkl", "rb") as f:
+                vertices = pickle.load(f)['vertices']
 
         # Read the GT object points and masks
         with open(f"{base_path}/{case_name}/final_data.pkl", "rb") as f:

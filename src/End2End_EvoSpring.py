@@ -128,7 +128,7 @@ class End2End_EvoSpring(ModelGeneral):
     def _get_mesh_pos(self, node_info):
         return node_info[..., 2*self.pos_dim: 3*self.pos_dim].clone()
 
-    def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, node_type, attn_mask=None):
+    def _EMD(self, node_feature, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, node_type):
         node_feature = self._get_nodal_latent_input(node_feature)
 
         # TODO: Generate edge features for spring-mass system if needed
@@ -137,7 +137,7 @@ class End2End_EvoSpring(ModelGeneral):
         # Add node type embeddings
         type_emb = self.node_type_embedding(node_type.long())
         x = x + type_emb
-        edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, self.temp, attn_mask)
+        edge_feature = self.process(x, edge_mech_in, m_ids, multi_gs, m_gs_parent, pos, self.temp)
 
         return edge_feature
     
@@ -188,7 +188,7 @@ class End2End_EvoSpring(ModelGeneral):
 
         return constrained_mask
     
-    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in, attn_mask=None):
+    def forward(self, m_idx, m_gs, m_gs_parent, node_in, edge_mech_in):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
@@ -197,7 +197,7 @@ class End2End_EvoSpring(ModelGeneral):
         node_pos, node_type = self._get_pos_type(node_in)
 
         # Process current frame through EMD
-        edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_type, attn_mask)
+        edge_feature = self._EMD(node_in, edge_mech_in, m_idx, m_gs, m_gs_parent, node_pos, node_type)
 
         edge_mech_in_bias = self.edge_decode(edge_feature)[0,:,0]  # Remove time dimension
 
@@ -207,8 +207,8 @@ class End2End_EvoSpring(ModelGeneral):
         s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
 
         # # Return spring stiffness and damping parameters (default + learnable bias)
-        drag_damping_out = self.drag_damping_0 + self.drag_damping_bias * 0 # 100
-        dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias * 0 # 1000
+        drag_damping_out = self.drag_damping_0 + self.drag_damping_bias * 100
+        dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias * 1000
 
         return s_out, drag_damping_out, dashpot_damping_out
     

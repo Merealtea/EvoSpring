@@ -176,14 +176,14 @@ class End2EndDataset(MeshGeneralDataset):
         self.cells = self.init_springs.cpu().numpy().T
 
         # 根据这个cells信息，构建一个对应的attn_mask，即两个点之间有边相连的才作为1，否则就设为0
-        num_nodes = len(self.mesh_pos)
-        attn_mask = np.zeros((num_nodes, num_nodes), dtype=bool)
-        # cells的每一行是[node_i, node_j]，表示这两个节点之间有边相连
-        for edge in self.cells.T:
-            i, j = edge[0], edge[1]
-            attn_mask[i, j] = True
-            attn_mask[j, i] = True  # 无向图，双向设置
-        self.attn_mask = ~torch.BoolTensor(attn_mask).to(cfg.device)
+        # num_nodes = len(self.mesh_pos)
+        # attn_mask = np.zeros((num_nodes, num_nodes), dtype=bool)
+        # # cells的每一行是[node_i, node_j]，表示这两个节点之间有边相连
+        # for edge in self.cells.T:
+        #     i, j = edge[0], edge[1]
+        #     attn_mask[i, j] = True
+        #     attn_mask[j, i] = True  # 无向图，双向设置
+        # self.attn_mask = ~torch.BoolTensor(attn_mask).to(cfg.device)
 
         # spring parameters
         self.spring_rest_length = self.init_rest_lengths.cpu().numpy()

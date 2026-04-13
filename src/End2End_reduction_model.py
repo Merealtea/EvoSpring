@@ -123,16 +123,31 @@ class PhysicsAwareAttentionPooling(nn.Module):
         return pe
     
     def forward(self, x: torch.Tensor, node_pos: torch.Tensor, node_mass: torch.Tensor, node_type: torch.Tensor,
-                adj_mask: torch.Tensor = None, tau: float = 1.0):
+                gs: torch.Tensor, tau: float = 1.0, prev_P = None):
         """
         输入:
         x: (N, in_features) 节点特征
         node_pos: (N, D_pos) 节点空间坐标
         node_mass: (N,) 或 (N, 1) 节点质量
-        node_type: (N,) 节点类型，里面的类型包含4类，其中第4类为控制点，我们现在不对控制点进行合并，只对其他点进行合并
+        node_type: (N,) 节点类型，里面的类型包含 4 类，其中第 4 类为控制点，我们现在不对控制点进行合并，只对其他点进行合并
+        adj_mask: (N, N) 邻接掩码，只有 adj_mask[i,j]=1 时 i 和 j 才是邻居点，才可以合并
+        tau: Gumbel-softmax 温度参数
+        prev_P: 预先给定的投影矩阵，如果提供则直接使用，否则使用 gumbel softmax 计算
         """
         N = x.shape[1]
         control_node_type = 3
+
+        # 从边索引 gs 构建邻接矩阵
+        # gs shape: (2, num_edges), 其中 gs[0] 是源节点，gs[1] 是目标节点
+        num_nodes = node_pos.shape[-2]
+        adj_mask = torch.zeros(num_nodes, num_nodes, device=node_pos.device, dtype=torch.bool)
+        if gs.shape[1] > 0:
+            adj_mask[gs[0], gs[1]] = True
+            # 使邻接矩阵对称 (无向图)
+            adj_mask = adj_mask | adj_mask.T
+        
+        # 将对角线设为 False (移除自环)
+        adj_mask.fill_diagonal_(False)
 
         # ==========================================
         # ★ Step 0: 动态构建物理矩阵 (修复) ★
@@ -154,34 +169,66 @@ class PhysicsAwareAttentionPooling(nn.Module):
         D_sq = diag_P + diag_P.transpose(0, 1) - 2 * P_gramian
         D_mat_base = torch.sqrt(torch.clamp(D_sq, min=0.0) + 1e-8)
 
-        if adj_mask is not None:
-            penalty_value = D_mat_base.max().detach() * 10.0
-            D_mat = D_mat_base.masked_fill(~adj_mask, penalty_value)
-        else:
-            D_mat = D_mat_base
+        # calculate adj matrix based on gs
+        
 
-        # --- Step 4: Gumbel-Softmax 动态分配 ---
+        penalty_value = D_mat_base.max().detach() * 10.0
+        D_mat = D_mat_base.masked_fill(~adj_mask, penalty_value)
+
+        # ==========================================
+        # ★ Step 4: Gumbel-Softmax 动态分配 + 直通估计器 ★
+        # ==========================================
+        # 无论是否提供 prev_P，都先计算 logits 和 soft version 用于梯度反向传播
         logits = -D_mat 
-        # [新增]: 构造掩码，隔离控制点
-        is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
+        
+        # 构造 forbidden_mask 来控制合并规则
         forbidden_mask = torch.zeros_like(logits, dtype=torch.bool)
         
         # 规则 1：控制点不能分配给别人 (即控制点所在的行，除了自己，其他都是 True)
+        is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
         forbidden_mask[is_control, :] = True
+        
         # 规则 2：别人不能分配给控制点 (即控制点所在的列，除了自己，其他都是 True)
         forbidden_mask[:, is_control] = True
-        # 规则 3：允许所有点（包括控制点）分配给自己
+        
+        # 规则 3：只有邻居点才可以合并 (adj_mask[i,j] == 0 表示不是邻居，不能合并)
+        if adj_mask is not None:
+            # adj_mask 为 0 的位置表示不是邻居，这些位置不能合并
+            non_neighbor_mask = (adj_mask == 0)
+            forbidden_mask = forbidden_mask | non_neighbor_mask
+        
+        # 规则 4：只有 node_type 相同的点才可以合并
+        # 构造一个矩阵，其中 [i,j] 为 True 表示 node_type[i] != node_type[j]
+        node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
+        type_diff_mask = node_type_1d.unsqueeze(0) != node_type_1d.unsqueeze(1)  # (N, N)
+        forbidden_mask = forbidden_mask | type_diff_mask
+        
+        # 规则 5：允许所有点（包括控制点）分配给自己 (对角线始终允许)
         diag_indices = torch.arange(N, device=logits.device)
         forbidden_mask[diag_indices, diag_indices] = False 
         
         # 将不允许分配的路径 logits 设为极小值，Gumbel-softmax 采样时概率将趋近于 0
         logits = logits.masked_fill(forbidden_mask, -1e9)
-        P_full = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+        
+        # 计算 soft version 用于梯度反向传播
+        P_soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+        
+        if prev_P is not None:
+            # 使用直通估计器：前向传播使用 prev_P，反向传播通过 P_soft 传递梯度到 logits
+            # P_full = prev_P + (P_soft - P_soft).detach() 这种形式不对
+            # 正确的直通估计器形式：P_full = P_soft + (prev_P - P_soft).detach()
+            # 这样前向传播时 P_full = prev_P，反向传播时梯度通过 P_soft 传递
+            P_full = P_soft + (prev_P - P_soft).detach()
+        else:
+            # 不使用 prev_P 时，使用标准的 hard gumbel softmax
+            P_full = (P_soft == P_soft.max(dim=-1, keepdim=True)[0]).float()
+        
+        # 计算 r_soft 用于 loss 计算（使用 soft version 计算）
+        r_soft = P_soft.max(dim=0)[0].sum()
 
         # --- Step 5: 提取降阶投影矩阵 P_proj ---
-        r_soft = P_full.max(dim=0)[0].sum()
         active_mask = P_full.sum(dim=0) > 0
-        P_proj = P_full[:, active_mask] # 形状: (N, r)
+        P_proj = P_full[:, active_mask] # 形状：(N, r)
         dynamic_r = P_proj.shape[1]
 
         # ==========================================
@@ -203,29 +250,81 @@ class PhysicsAwareAttentionPooling(nn.Module):
         # --- Step 8: 物理系统降阶与 Loss 计算 ---
         # 直接用 P_proj 的转置去乘质量向量
         # (..., r, N) @ (..., N, 1) -> (..., r, 1)
-        node_mass_hat = P_proj.transpose(-1, -2) @ node_mass
+        node_mass_hat = node_mass @ P_proj
         node_type_hat = node_type[:, active_mask]
 
         # (修复) lambda_reg 现已通过 self 访问
         intra_cluster_loss = torch.trace(P_proj.transpose(-1, -2) @ D_mat @ P_proj)
         total_loss = intra_cluster_loss + self.lambda_reg * r_soft
+        
+        ids = torch.where(active_mask)[0].cpu().numpy().tolist()
 
-        idx = torch.where(active_mask)[0].cpu().numpy().tolist()
-
-        return idx, gs, x_hat, pos_hat, node_mass_hat, node_type_hat, total_loss, dynamic_r
+        return ids, gs, x_hat, pos_hat, node_mass_hat, node_type_hat, total_loss, dynamic_r, P_full
     
 class End2End_amp_base(MessagePassing):
-    def __init__(self, latent_dim, hidden_layer, pos_dim, lagrangian):
+    def __init__(self, latent_dim, hidden_layer, pos_dim, lagrangian, node_type_embedding_dim=8, mass_embedding_dim=8):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp_node_delta = MLP(2 * latent_dim, latent_dim, latent_dim, hidden_layer, True)
-        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 + 2 if lagrangian else 2 * latent_dim + pos_dim + 1
+        # edge_info_in_len: 2 * latent_dim for node i and j
+        # + 2 * pos_dim + 2 for lagrangian (dir and norm_w and norm_m)
+        # + 20 for spring_encoded
+        # + 2 * node_type_embedding_dim for node type embedding (i and j)
+        # + 2 * mass_embedding_dim for node mass embedding (i and j)
+        edge_info_in_len = 2 * latent_dim + 2 * pos_dim + 2 + 20 + 2 * node_type_embedding_dim + 2 * mass_embedding_dim if lagrangian else 2 * latent_dim + pos_dim + 1 + 20 + 2 * node_type_embedding_dim + 2 * mass_embedding_dim
         self.mlp_edge_info = MLP(edge_info_in_len, latent_dim, latent_dim, hidden_layer, True)
         self.mlp_edge_weight = Seq(*[MLP(latent_dim, latent_dim, 1, hidden_layer, False)])
         self.lagrangian = lagrangian
         self.pos_dim = pos_dim
         self.latent_dim = latent_dim
+        
+        # Node type embedding: 4 types (0: object, 1: surface, 2: interior, 3: controller)
+        self.node_type_embedding = torch.nn.Embedding(4, node_type_embedding_dim)
+        
+        # Mass embedding: use MLP to embed scalar mass value
+        self.mass_embedding = MLP(1, mass_embedding_dim, mass_embedding_dim, 2, True)
 
-    def forward(self, x, g, pos):
+    def positional_encoding(self, positions, num_freq_bands=10):
+        """
+        NeRF-style positional encoding
+        Args:
+            positions: [N, 3] normalized positions in [-1, 1]
+            num_freq_bands: number of frequency bands (L)
+        Returns:
+            encoded_positions: [N, 3 * 2 * L] encoded positions
+        """
+        # positions shape: [N, 3]
+        freq_bands = 2.0 ** torch.arange(num_freq_bands, dtype=positions.dtype, device=positions.device)  # [L]
+        # freq_bands shape: [L]
+
+        # Expand dimensions for broadcasting: positions [N, 3, 1], freq_bands [1, 1, L]
+        pos_expanded = positions.unsqueeze(-1)  # [N, 3, 1]
+        freq_expanded = freq_bands.unsqueeze(0).unsqueeze(0)  # [1, 1, L]
+
+        # Compute scaled positions: [N, 3, L]
+        scaled_pos = math.pi * pos_expanded * freq_expanded
+
+        # Apply sin and cos
+        sin_encoded = torch.sin(scaled_pos)  # [N, 3, L]
+        cos_encoded = torch.cos(scaled_pos)  # [N, 3, L]
+
+        # Interleave sin and cos: [N, 3, 2*L]
+        encoded = torch.stack([sin_encoded, cos_encoded], dim=-1)  # [N, 3, L, 2]
+        encoded = encoded.reshape(positions.shape[0], positions.shape[1], -1)  # [N, 3, 2*L]
+
+        # Flatten to [N, 3 * 2 * L]
+        encoded = encoded.reshape(positions.shape[0], -1)
+
+        return encoded
+
+    def forward(self, x, g, pos, node_type=None, node_mass=None):
+        """
+        Args:
+            x: node features, shape (T, N, F) or (N, F)
+            g: edge index, tuple of (src, dst) tensors
+            pos: node positions, shape (T, N, 3) or (N, 3)
+            node_type: node types, shape (N,) or (T, N), values in {0, 1, 2, 3}
+            node_mass: node masses, shape (N,) or (N, 1) or (T, N, 1)
+        """
         i = g[0]
         j = g[1]
         if len(x.shape) == 3:
@@ -255,11 +354,40 @@ class End2End_amp_base(MessagePassing):
         else:
             norm = torch.norm(dir, dim=-1, keepdim=True)  # in shape (T),N,1
             fiber = torch.cat([dir, norm], dim=-1)
-        
+
+        # normalize spring_rest_length into [-1,1]
+        spring_rest_length = fiber[..., 3]
+        spring_min = spring_rest_length.min(dim=1, keepdim=True)[0]
+        spring_max = spring_rest_length.max(dim=1, keepdim=True)[0]
+        normalized_spring_rest_length = (2 * (spring_rest_length - spring_min) / (spring_max - spring_min) - 1)[0]
+
+        # apply NeRF-style positional encoding to spring lengths
+        spring_encoded = self.positional_encoding(normalized_spring_rest_length[:, None], num_freq_bands=10)[None]
+
+        # Compute node type and mass embeddings and concatenate to fiber
+        if node_type is not None and node_mass is not None:
+            # Ensure node_type is 1D
+            if node_type.dim() == 2:
+                node_type = node_type.squeeze(0)
+            # Ensure node_mass is 2D (N, 1)
+            if node_mass.dim() == 1:
+                node_mass = node_mass.unsqueeze(-1)
+            elif node_mass.dim() == 3:
+                node_mass = node_mass.squeeze(1)
+            
+            # Get embeddings for nodes i and j
+            node_type_i = self.node_type_embedding(node_type[i])[None]  # (N, type_emb_dim)
+            node_type_j = self.node_type_embedding(node_type[j])[None]  # (N, type_emb_dim)
+            node_mass_i = self.mass_embedding(node_mass[:, i, None]) # (N, mass_emb_dim)
+            node_mass_j = self.mass_embedding(node_mass[:, j, None])  # (N, mass_emb_dim)
+            
+            # Concatenate embeddings to fiber
+            fiber = torch.cat([fiber, node_type_i, node_type_j, node_mass_i, node_mass_j], dim=-1)
+
         if len(x.shape) == 3 and len(pos.shape) == 2:
             tmp = torch.cat([fiber.unsqueeze(0).repeat(T, 1, 1), x_i, x_j], dim=-1)
         else:
-            tmp = torch.cat([fiber, x_i, x_j], dim=-1)
+            tmp = torch.cat([fiber, x_i, x_j, spring_encoded], dim=-1)
         
         edge_embedding = self.mlp_edge_info(tmp)
         edge_weight = self.mlp_edge_weight(edge_embedding)
@@ -272,11 +400,14 @@ class End2End_amp_base(MessagePassing):
         return self.mlp_node_delta(tmp) + x, edge_weight, edge_embedding
 
 class End2EndReduction(EvoMesh):
-    def __init__(self, l_n, pre_l_n, bottom_ln, ld, hidden_layer, pos_dim, lagrangian, enhance=True, agg_conv_pos=False, edge_set_num=1):
+    def __init__(self, l_n, pre_l_n, bottom_ln, ld, hidden_layer, pos_dim, lagrangian, enhance=True, agg_conv_pos=False, edge_set_num=1,
+                 transformer_hidden_dim=128, transformer_num_layers=2, pos_encoding_dim=30,
+                 node_type_embedding_dim=8, mass_embedding_dim=8,
+                 pooling_num_heads=1, k_eigenvectors=8, pooling_lambda_reg=0.1, pooling_sigma=1.0):
         super(EvoMesh, self).__init__()
         self.down_gmps = nn.ModuleList()
         self.up_gmps = nn.ModuleList()
-        self.downpools = nn.ModuleList()
+        self.downpools = nn.ModuleList()  # 使用 PhysicsAwareAttentionPooling 进行下采样
         self.unpools = nn.ModuleList()
         self.l_n = l_n
         self.edge_conv = WeightedEdgeConv()
@@ -284,127 +415,214 @@ class End2EndReduction(EvoMesh):
         self.enhance = enhance
         self.agg_conv_pos = agg_conv_pos
         self.bottom_ln = bottom_ln
-        self.bottom_gmp = nn.ModuleList(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian) for _ in range(self.bottom_ln))
+        self.node_type_embedding_dim = node_type_embedding_dim
+        self.mass_embedding_dim = mass_embedding_dim
+        self.bottom_gmp = nn.ModuleList(
+            End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian, node_type_embedding_dim, mass_embedding_dim) 
+            for _ in range(self.bottom_ln)
+        )
 
         for _ in range(self.l_n):
-            self.down_gmps.append(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian))
-            self.downpools.append(PhysicsAwareAttentionPooling(ld))
-            self.up_gmps.append(End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian))
+            self.down_gmps.append(
+                End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian, node_type_embedding_dim, mass_embedding_dim)
+            )
+            self.downpools.append(
+                PhysicsAwareAttentionPooling(ld, pooling_num_heads, k_eigenvectors, pooling_lambda_reg, pooling_sigma)
+            )
+            self.up_gmps.append(
+                End2End_amp_base(ld, hidden_layer, pos_dim, lagrangian, node_type_embedding_dim, mass_embedding_dim)
+            )
             self.unpools.append(Unpool())
         self.esn = edge_set_num
         self.lagrangian = lagrangian
 
-        # Transformer components for attention map calculation
-        self.attn_nhead = 8
+        # Transformer components for encoding reduced node features
         self.ld = ld
         self.pos_dim = pos_dim
-
-        # Position encoding generator
-        self.pos_encoder = nn.Linear(pos_dim, ld)
+        self.pos_encoding_dim = pos_encoding_dim
+        
+        # NeRF-style positional encoding for 3D positions
+        # Output dim: 3 * 2 * num_freq_bands = pos_encoding_dim
+        self.num_freq_bands = pos_encoding_dim // 6
+        
+        # Position encoding to transformer hidden dim projection
+        self.pos_to_transformer = nn.Linear(self.pos_encoding_dim, transformer_hidden_dim)
+        
+        # Node feature to transformer hidden dim projection
+        self.node_to_transformer = nn.Linear(ld, transformer_hidden_dim)
+        
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_hidden_dim,
+            nhead=max(1, transformer_hidden_dim // 32),
+            dim_feedforward=transformer_hidden_dim * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_num_layers)
+        
+        # Transformer output projection back to original feature dim
+        self.transformer_output_proj = nn.Linear(transformer_hidden_dim, ld)
 
         self.edge_weight = MLP(2*ld, ld, ld, hidden_layer, True)
+        # Node type embedding: 4 types (0: object, 1: surface, 2: interior, 3: controller)
+        self.node_type_embedding = torch.nn.Embedding(4, ld)
 
-    def pool_edge(self, g, idx, num_nodes, num_orignal_edge):
-        idx = idx.to(torch.long)
-        idx_new_valid = torch.arange(len(idx), dtype=torch.long, device=g.device)
-        idx_new_all = -1 * torch.ones(num_nodes, dtype=torch.long, device=g.device)
-        idx_new_all[idx] = idx_new_valid
-        new_g = -1 * torch.ones_like(g, dtype=torch.long, device=g.device)
-        new_g[0] = idx_new_all[g[0]]
-        new_g[1] = idx_new_all[g[1]]
+    def positional_encoding_3d(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        NeRF-style positional encoding for 3D positions
+        Args:
+            positions: (B, N, 3) or (N, 3) 3D coordinates (normalized to [-1, 1])
+        Returns:
+            encoded: (B, N, pos_encoding_dim) or (N, pos_encoding_dim)
+        """
+        if positions.dim() == 2:
+            positions = positions.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+            
+        B, N, D = positions.shape
+        device, dtype = positions.device, positions.dtype
+        
+        # Frequency bands: 2^0, 2^1, ..., 2^(num_freq_bands-1)
+        freq_bands = 2.0 ** torch.arange(self.num_freq_bands, dtype=dtype, device=device)  # [L]
+        
+        # Expand for broadcasting: positions [B, N, 3, 1], freq_bands [1, 1, 1, L]
+        pos_expanded = positions.unsqueeze(-1)  # [B, N, 3, 1]
+        freq_expanded = freq_bands.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, L]
+        
+        # Compute scaled positions: [B, N, 3, L]
+        scaled_pos = math.pi * pos_expanded * freq_expanded
+        
+        # Apply sin and cos: [B, N, 3, L]
+        sin_encoded = torch.sin(scaled_pos)
+        cos_encoded = torch.cos(scaled_pos)
+        
+        # Stack and reshape: [B, N, 3, L, 2] -> [B, N, 3*L*2]
+        encoded = torch.stack([sin_encoded, cos_encoded], dim=-1)  # [B, N, 3, L, 2]
+        encoded = encoded.reshape(B, N, -1)  # [B, N, 3*L*2]
+        
+        if squeeze_output:
+            encoded = encoded.squeeze(0)
+        
+        return encoded
 
-        # new_g[:, :num_orignal_edge] is the original edge
-        both_valid = (new_g[0] >= 0) & (new_g[1] >= 0)
-        e_idx = torch.where(both_valid)[0]
+    def _pool_tensor(self, tensor, node_mask):
+        tensor = node_mask[None, :, None].float() * tensor
+        return tensor[:, node_mask]
 
-        original_valid = e_idx[e_idx < num_orignal_edge]
-        new_g = new_g[:, e_idx]
-
-        new_edge_parent = torch.full((new_g.shape[1], 1), -1, dtype=torch.long, device=g.device)
-        new_edge_parent[:len(original_valid)] = torch.arange(num_orignal_edge, dtype=torch.long, device=g.device).unsqueeze(-1)[original_valid]
-        return new_g, new_edge_parent
-
-    def forward(self, node_in, m_ids, m_gs, pos, node_mass, node_type, temp=0.1):
-        # node_in is in shape of (T), N, F
-        # if edge_set_num>1, then m_g is in shape: Level,(Set),2,Edges, the 0th Set is main/material graph
-        # pos is in (T),N,D
-
+    def forward(self, node_in, m_ids, m_gs, m_pos, m_mass, m_type, temp=0.1, m_proj=None):
+        """
+        使用 PhysicsAwareAttentionPooling 进行内部下采样的前向传播。
+        流程：先 pool -> down_gmps -> edge conv -> PhysicsAwareAttentionPooling 获取下采样的 gs, proj 等
+        
+        Args:
+            node_in: 节点输入特征，shape (N, F) 或 (T, N, F)
+            m_ids: 每层节点索引列表
+            m_gs: 每层边索引列表
+            m_proj: 每层投影矩阵列表
+            m_node_pos: 每层节点位置列表
+            m_node_mass: 每层节点质量列表
+            m_node_type: 每层节点类型列表
+            temp: Gumbel-softmax 温度参数
+            adj_mask: 邻接掩码，shape (N, N)，可选
+        """
+        down_ids = []
+        down_gs = []
         down_outs = []
         down_ps = []
+        down_mass = []
+        down_type = []
         cts = []
-
-        # w = pos.new_ones((pos.shape[-2], 1)) if weights is None else weights
-        node_in = node_in[None, ...]
-        pos = pos[None, ...]
-        node_type = node_type[None, ...]
-
-        # down pass
-        l_n = self.l_n 
-        num_nodes_list = []
-        ds_edge_embedding = []
-        ds_node_mass = []
-        ds_node_type = []
-
-        for i in range(l_n):
-            num_nodes = node_in.shape[-2] #.shape[0]
-            num_nodes_list.append(num_nodes)
-
-            ds_node_mass.append(node_mass)
-            ds_node_type.append(node_type)
-            
-            gs = m_gs[i]
-            # 2. 初始化全 False 的邻接矩阵 (False 暂时代指没有边)
-            adj_mat = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=node_in.device)
-            
-            # 3. 填入存在的边 (src -> dst 和 dst -> src 保证对称)
-            src, dst = gs[0], gs[1]
-            adj_mat[src, dst] = True
-            adj_mat[dst, src] = True
-            
-            node_in, ew, edge_embedding = self.down_gmps[i](node_in, gs, pos)
-            if i == 0 and self.lagrangian:
-                node_in, ew = self.down_gmps[i](node_in, gs, pos)
-
-            ds_edge_embedding.append(edge_embedding)
-
-            # record the info
-            down_outs.append(node_in)
-            down_ps.append(pos)
-            # inter-level fusion
-            tmp_g = gs
-            node_in = self.edge_conv(node_in, tmp_g, ew)
-
-            cts.append(ew)
-
-            # add merge here
-            idx, gs, node_in, pos, node_mass, node_type, auxiliary_loss, dynamic_r \
-                = self.downpools[i](node_in, pos, node_mass, node_type, adj_mat, temp)
-            
-            m_gs.append(gs)
-            m_ids.append(idx)
-            
+        pooling_losses = []
+        down_proj_list = []  # 存储 PhysicsAwareAttentionPooling 生成的投影矩阵
         
+        # 确保输入有 batch 维度
+        if node_in.dim() == 2:
+            node_in = node_in[None, ...]  # (1, N, F)
+        
+        
+        # down pass
+        ds_edge_embedding = []
+        
+        gs = m_gs[0]
+        pos = m_pos[0][None]
+        node_mass = m_mass[0][None]
+        node_type = m_type[0][None]
+
+        down_gs = [gs]
+        down_ps = [pos]
+        down_mass = [node_mass]
+        down_type = [node_type]
+        
+        for i in range(self.l_n):
+            # Step 2: down_gmps - 使用 AMP 处理边信息
+            node_in, ew, edge_embedding =\
+                self.down_gmps[i](node_in, gs, pos, 
+                                    node_type=node_type, 
+                                    node_mass=node_mass)
+            
+            # Step 3: edge conv - 使用边卷积更新节点特征
+            node_in = self.edge_conv(node_in, gs, ew)
+
+            down_outs.append(node_in)
+            ds_edge_embedding.append(edge_embedding)
+            cts.append(ew)
+            
+            # Step 4: PhysicsAwareAttentionPooling - 获取下采样的 gs, proj 等
+            if not m_proj:
+                idx, gs, node_in, pos, node_mass, node_type, pool_loss, dynamic_r, P_proj =\
+                    self.downpools[i](
+                        node_in, pos, node_mass, node_type, gs, 
+                        tau=temp)
+            else:
+                idx, gs, node_in, pos, node_mass, node_type, pool_loss, dynamic_r, P_proj =\
+                    self.downpools[i](
+                        node_in, pos, node_mass, node_type, gs, 
+                        temp, m_proj[i])
+                
+            down_ids.append(idx)
+            down_gs.append(gs)
+                
+            pooling_losses.append(pool_loss)
+            down_ps.append(pos)
+            down_mass.append(node_mass)
+            down_type.append(node_type)
+            down_proj_list.append(P_proj)
+            
+        # Prepare node_type and node_mass for bottom layer
         for l in range(self.bottom_ln):
-            node_in, ew, _ = self.bottom_gmp[l](node_in, m_gs[l_n], pos)
-            if self.lagrangian and l == 0:
-                node_in, ew, _ = self.bottom_gmp[l](node_in, m_gs[l_n], pos)
+            node_in, ew, _ = self.down_gmps[i](node_in, 
+                                               down_gs[self.l_n], 
+                                               down_ps[self.l_n], 
+                                               node_type=node_type, 
+                                               node_mass=node_mass)
 
         # up pass
         mlvl_edge_embedding = []
-        m_gs_out = []
-        for i in range(l_n):
-            up_idx = l_n - i - 1
-            g, idx = m_gs[up_idx], m_ids[up_idx]
-            try:
-                node_in = self.unpools[i](node_in, down_outs[up_idx].shape[-2], idx)
-            except:
-                import pdb; pdb.set_trace()
-            tmp_g = g[0] if self.esn > 1 else g
-            node_in= self.edge_conv(node_in, tmp_g, cts[up_idx], aggragating=False)
-            node_in, ew_u, edge_embedding = self.up_gmps[i](node_in, g, down_ps[up_idx])
-     
-            # if up_idx == 0 and self.lagrangian:
-            #     node_in, ew_u = self.up_gmps[i](node_in, edge_mech_in, g, down_ps[up_idx])
+
+        for i in range(self.l_n):
+            up_idx = self.l_n - i - 1
+            # 使用 downpools 生成的 gs 进行 up pass
+            gs = down_gs[up_idx] 
+
+            node_in = self.unpools[i](node_in, 
+                                      down_outs[up_idx].shape[-2], 
+                                      down_ids[up_idx])
+            
+            node_in= self.edge_conv(node_in, gs, cts[up_idx], aggragating=False)
+            # Prepare node_type and node_mass for up pass
+            node_type_up = down_type[up_idx]
+            node_mass_up = down_mass[up_idx]
+
+            node_in, _, edge_embedding = self.up_gmps[i](
+                node_in, gs, down_ps[up_idx], 
+                node_type=node_type_up, node_mass=node_mass_up
+            )
+                        
             node_in = node_in + down_outs[up_idx]
 
             edge_embedding = edge_embedding + ds_edge_embedding[up_idx]            
@@ -412,10 +630,17 @@ class End2EndReduction(EvoMesh):
 
             # Average symmetric edges
             edge_feature = edge_embedding[:, :num_edge//2] + edge_embedding[:, num_edge//2:]
-            m_gs_out.insert(0, g[:, :num_edge // 2])
             mlvl_edge_embedding.insert(0, edge_feature)
         
-        # print(num_nodes_list)
-        m_ids.insert(0, [i for i in range(num_nodes_list[0])])
-        m_ids.pop(-1)
-        return mlvl_edge_embedding, ds_node_mass, ds_node_type, m_gs_out, m_ids
+        down_ids.insert(0, [x for x in range(node_in.shape[1])])
+        # Return downsample results for warp construction
+        downsample_results = {
+            'down_ids': down_ids,
+            'down_gs': down_gs,
+            'down_proj': down_proj_list,
+            'down_ps': down_ps,
+            'down_mass': down_mass,
+            'down_type': down_type,
+        }
+        
+        return mlvl_edge_embedding, pooling_losses, downsample_results

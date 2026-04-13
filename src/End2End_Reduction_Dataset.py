@@ -302,7 +302,7 @@ class End2EndReductionDataset(MeshGeneralDataset):
         num_original_points = sum(node_type==0).item()
         num_surface_points = num_original_points + sum(node_type==1).item() 
         num_all_points = num_surface_points + sum(node_type==2).item()
-
+    
         # Initialize parameters from cfg
         simulator = SpringMassSystemWarp(
             init_vertices,

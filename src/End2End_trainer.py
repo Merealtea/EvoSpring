@@ -606,8 +606,6 @@ class E2ETrainer:
 
         if mode != 'train':
             self.model.eval()
-
-        attn_mask = self.mdata.attn_mask
             
         # 运行仿真
         if mode == 'train':
@@ -620,7 +618,7 @@ class E2ETrainer:
                 st = time()
 
                 new_spring_Y, drag_damping_out, dashpot_damping_out =\
-                      self.model(m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature, attn_mask)
+                      self.model(m_ids, m_gs, m_gs_parent, node_in_feature, edge_mech_in_feature)
                 log_new_spring_Y = torch.log(new_spring_Y) #+ 1e-8)  # 添加小值避免 log(0)
 
                 # [关键] 映射到 Warp 时，必须设置 requires_grad=True

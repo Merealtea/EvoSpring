@@ -267,7 +267,7 @@ class End2End(EvoMesh):
         new_edge_parent[:len(original_valid)] = torch.arange(num_orignal_edge, dtype=torch.long, device=g.device).unsqueeze(-1)[original_valid]
         return new_g, new_edge_parent
 
-    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, temp=0.1, attn_mask=None):
+    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, temp=0.1):
         # node_in is in shape of (T), N, F
         # if edge_set_num>1, then m_g is in shape: Level,(Set),2,Edges, the 0th Set is main/material graph
         # pos is in (T),N,D
@@ -344,13 +344,15 @@ class End2End(EvoMesh):
                 m_gs_parent.append(gs_parent_new)
                 assert len(m_ids) == i + 1
 
-            # record the info
-            down_outs.append(node_in)
-            down_ps.append(pos)
+            
             # inter-level fusion
             tmp_g = gs
             node_in = self.edge_conv(node_in, tmp_g, ew)
 
+            # record the info
+            down_outs.append(node_in)
+            down_ps.append(pos)
+            
             if self.agg_conv_pos:
                 pos = self.edge_conv(pos, tmp_g, ew)
 

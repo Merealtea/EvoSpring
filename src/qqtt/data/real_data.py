@@ -36,6 +36,7 @@ class RealData:
         self.structure_points = np.concatenate(
             [object_points[0], other_surface_points, interior_points], axis=0
         )
+
         self.structure_points = torch.tensor(
             self.structure_points, dtype=torch.float32, device=cfg.device
         )
