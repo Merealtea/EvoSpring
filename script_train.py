@@ -31,14 +31,10 @@ if not os.path.exists(base_path):
 
 dir_names = os.listdir(base_path)
 finished_cases = os.listdir(res_path)
-
-dir_names = ['single_clift_cloth_3', 'single_lift_rope', 'double_lift_zebra', 'double_lift_sloth', 'single_push_sloth'] # small batch test
-
+'single_clift_cloth_3', 'single_lift_rope',  'double_lift_zebra', 
+dir_names = ['double_lift_sloth', 'single_push_sloth'] # small batch test
+# dir_names = ['double_lift_zebra']
 for idx, case_name in enumerate(dir_names):
-    # if 'cloth' in case_name or 'package' in case_name:
-    #     # pass this right now
-    #     continue
-
     # case_name = 'single_clift_cloth_3' # DEBUG
 
     print(f"Running case: {case_name}")

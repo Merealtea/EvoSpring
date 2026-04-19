@@ -31,14 +31,19 @@ class End2EndReduction_EvoSpring(ModelGeneral):
         self.process = End2EndReduction(layer_num, pre_layer_num, bottom_layer_num, ld, mlp_hidden_layer, pos_dim,
                                     self.lagrangian, enhance, agg_conv_pos, edge_set_num,
                                     transformer_hidden_dim=128, transformer_num_layers=2, pos_encoding_dim=30)
-
-        self.edge_decode = MLP(ld, ld, 1, 3, False)
+        
+        # 用于第一层之后预测标量 bias 的 decoder（每层一个独立的 MLP）
+        # 将 edge_feature (1*M*C) 压缩为 1*C，然后预测一个标量
+        self.edge_decode = torch.nn.ModuleList([
+            MLP(ld, ld, 1, 3, False)
+            for _ in range(layer_num)
+        ])
 
         self.MP_times = MP_times
         self.pos_dim = pos_dim
         self.gamma = 0.5
 
-        self.temp = torch.tensor(1.0)
+        self.temp = torch.tensor(0.1)
         self.S_0 = default_spring_Y
 
         # Store default damping values
@@ -105,12 +110,12 @@ class End2EndReduction_EvoSpring(ModelGeneral):
     def _get_mesh_pos(self, node_info):
         return node_info[..., : self.pos_dim].clone()
 
-    def _EMD(self, node_feature, m_ids, m_gs, m_proj, m_pos, m_node_mass, m_node_type):
+    def _EMD(self, node_feature, m_ids, m_gs, m_proj, m_pos, m_node_mass, m_node_type, object_radius=None):
         node_feature = self._get_nodal_latent_input(node_feature)
      
         x = self.encode(node_feature)
        
-        mlvl_edge_feature, pooling_losses, downsample_results = self.process(x, m_ids, m_gs, m_pos, m_node_mass, m_node_type, self.temp, m_proj)
+        mlvl_edge_feature, pooling_losses, downsample_results = self.process(x, m_ids, m_gs, m_pos, m_node_mass, m_node_type, self.temp, m_proj, object_radius)
 
         for key in downsample_results:
             if key in ['down_ps','down_mass' ,'down_type']:
@@ -118,7 +123,7 @@ class End2EndReduction_EvoSpring(ModelGeneral):
                     downsample_results[key][idx] = info[0]
         return mlvl_edge_feature, pooling_losses, downsample_results
     
-    def forward(self, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type, node_in):
+    def forward(self, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type, node_in, object_radius=None):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
@@ -128,11 +133,15 @@ class End2EndReduction_EvoSpring(ModelGeneral):
         mlvl_dashpot_damping_out = []
 
         # Process current frame through EMD
-        mlvl_edge_feature, pooling_losses, downsample_results = self._EMD(node_in, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type)
+        mlvl_edge_feature, pooling_losses, downsample_results = \
+            self._EMD(node_in, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type, object_radius)
 
         for lvl, edge_feature in enumerate(mlvl_edge_feature):
-            # predict edge_mech_bias
-            edge_mech_in_bias = self.edge_decode(edge_feature)[0,:,0]
+            # edge_feature shape: (1, M, C)
+            M = edge_feature.shape[1]
+            
+            edge_mech_in_bias = self.edge_decode[lvl](edge_feature)[0, :, 0]  # shape: (M,)
+
             s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
             s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
             mlvl_s_out.append(s_out)
@@ -140,9 +149,10 @@ class End2EndReduction_EvoSpring(ModelGeneral):
             # 2. predict drag_damping bias
             # # Return spring stiffness and damping parameters (default + learnable bias)
             drag_damping_out = self.drag_damping_0 + self.drag_damping_bias[lvl] * 100
-            dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias[lvl] * 1000
+            dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias[lvl] * 100
 
-            # drag_out = torch.clip(drag_out, 1e-8, 100.0) 
+            drag_damping_out = torch.clip(drag_damping_out, 1e-8, 20.0) 
+            dashpot_damping_out = torch.clip(dashpot_damping_out, 1e-8, 200.0) 
             mlvl_drag_damping_out.append(drag_damping_out)
             mlvl_dashpot_damping_out.append(dashpot_damping_out)
     

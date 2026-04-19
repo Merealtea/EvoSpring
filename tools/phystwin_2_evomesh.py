@@ -7,8 +7,11 @@ import os
 import torch
 
 def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except:
+        import pdb; pdb.set_trace()
 
 def compute_normalization_info(data_dict):
     """
@@ -48,14 +51,17 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     # 1. 读取数据
     # ==============================
     print(f"读取数据: {opt_pkl_path}")
-    zero_grad_opt_data = load_pickle(opt_pkl_path)
     
+    zero_grad_opt_data = load_pickle(opt_pkl_path)
+
     # 获取两组点云 (T, N, 3)
     # Original object points captured by Depth Camera
     object_points = zero_grad_opt_data['object_points']
     # Controller points captured by Depth Camera
-    controller_points = zero_grad_opt_data['controller_points']
-
+    try:
+        controller_points = zero_grad_opt_data['controller_points']
+    except:
+        import pdb; pdb.set_trace()
     # surface points and interior points generate from shape prior, only for first frame
     surface_points = zero_grad_opt_data['surface_points']
     interior_points = zero_grad_opt_data['interior_points']
@@ -102,7 +108,6 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     # dashdot_damping 参数
     dashpot_damping = connect_params['dashpot_damping']
     drag_damping = connect_params['drag_damping']
-    import pdb; pdb.set_trace()
     global_spring_Y = connect_params['global_spring_Y']
 
     # collide 参数
@@ -193,6 +198,7 @@ def create_optimization_dataset(opt_pkl_path, connect_params_pkl_path, mech_file
     # 4. 读取优化后的机械属性
     # ==============================
     print(f"读取机械属性: {mech_file}")
+    
     opt_spring = torch.load(mech_file, map_location='cpu')
 
     spring_property = opt_spring['spring_Y'].numpy().astype(np.float32)
@@ -328,7 +334,7 @@ if __name__ == "__main__":
     output_dir = './evomesh_optimization_outputs'
     os.makedirs(output_dir, exist_ok=True)
     for obj_case in object_cases:
-        object_cases = 'single_lift_cloth_4'
+        
         opt_file = os.path.join(opt_file_path, obj_case, "final_data.pkl")
         params_file = os.path.join(param_file_path, obj_case, "optimal_params.pkl")
         split_file = os.path.join(opt_file_path, obj_case, "split.json")

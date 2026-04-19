@@ -18,7 +18,9 @@ def load_global_trajectory(dir_name):
     
     返回：vertices (所有 level 的列表), masses, edges, gt_indices
     """
-    traj_path = f"{dir_name}/trajectories/global_best_trajectory.pkl"
+    lastest_timestamp = sorted(os.listdir(dir_name))[-1]
+
+    traj_path = f"{dir_name}/{lastest_timestamp}/trajectories/global_best_trajectory.pkl"
     
     if not os.path.exists(traj_path):
         print(f"Warning: Global trajectory file not found: {traj_path}")

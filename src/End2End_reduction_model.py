@@ -123,19 +123,22 @@ class PhysicsAwareAttentionPooling(nn.Module):
         return pe
     
     def forward(self, x: torch.Tensor, node_pos: torch.Tensor, node_mass: torch.Tensor, node_type: torch.Tensor,
-                gs: torch.Tensor, tau: float = 1.0, prev_P = None):
+                gs: torch.Tensor, tau: float = 1.0, prev_P = None, object_radius: float = None):
         """
         输入:
-        x: (N, in_features) 节点特征
+        x: (N, in_features) 节点输入特征
         node_pos: (N, D_pos) 节点空间坐标
         node_mass: (N,) 或 (N, 1) 节点质量
         node_type: (N,) 节点类型，里面的类型包含 4 类，其中第 4 类为控制点，我们现在不对控制点进行合并，只对其他点进行合并
         adj_mask: (N, N) 邻接掩码，只有 adj_mask[i,j]=1 时 i 和 j 才是邻居点，才可以合并
         tau: Gumbel-softmax 温度参数
         prev_P: 预先给定的投影矩阵，如果提供则直接使用，否则使用 gumbel softmax 计算
+        object_radius: 物体半径阈值，当两个点之间的距离大于此值时，不允许合并这两个点
         """
         N = x.shape[1]
         control_node_type = 3
+
+        object_radius /= 2 # 防止新的edge超过object_raduis
 
         # 从边索引 gs 构建邻接矩阵
         # gs shape: (2, num_edges), 其中 gs[0] 是源节点，gs[1] 是目标节点
@@ -148,19 +151,28 @@ class PhysicsAwareAttentionPooling(nn.Module):
         
         # 将对角线设为 False (移除自环)
         adj_mask.fill_diagonal_(False)
-
-        # ==========================================
-        # ★ Step 0: 动态构建物理矩阵 (修复) ★
-        # ==========================================
-        L = self.compute_laplacian_from_pos(node_pos, adj_mat=adj_mask)
-
-        # --- Step 1 & 2: 提取特征与归一化 ---
-        pe = self.compute_pe(L)
-        x_pe = x + self.pe_proj(pe)
         
-        # TODO(add attn mask here)
-        attn_output, _ = self.mha(query=x_pe, key=x_pe, value=x_pe, need_weights=False)
-        z = attn_output.squeeze(0)  
+        # ==========================================
+        # ★ Step 0: 基于 object_radius 的距离约束 (新增) ★
+        # ==========================================
+        # 如果提供了 object_radius，则计算所有点对之间的距离，并更新 adj_mask
+        if object_radius is not None and object_radius > 0:
+            # 计算距离矩阵 (N, N)
+            dist_matrix = torch.cdist(node_pos, node_pos, p=2.0)  # shape: (1, N, N) or (N, N)
+            
+            # 创建距离约束掩码：距离大于 object_radius 的位置为 True，表示不允许合并
+            distance_forbidden_mask = dist_matrix > object_radius
+            
+            # 如果 dist_matrix 有 batch 维度，需要 squeeze
+            if distance_forbidden_mask.dim() == 3:
+                distance_forbidden_mask = distance_forbidden_mask[0]  # (N, N)
+            
+            # 将距离过远的位置从邻接掩码中移除
+            adj_mask = adj_mask & (~distance_forbidden_mask)
+            print(f"[Distance Constraint] object_radius={object_radius}, filtered out {(dist_matrix > object_radius).sum().item()} pairs with distance > {object_radius}")
+
+
+        z = x.squeeze(0)  
         z_norm = F.normalize(z, p=2, dim=-1)
 
         # --- Step 3: 距离矩阵计算 ---
@@ -170,8 +182,6 @@ class PhysicsAwareAttentionPooling(nn.Module):
         D_mat_base = torch.sqrt(torch.clamp(D_sq, min=0.0) + 1e-8)
 
         # calculate adj matrix based on gs
-        
-
         penalty_value = D_mat_base.max().detach() * 10.0
         D_mat = D_mat_base.masked_fill(~adj_mask, penalty_value)
 
@@ -184,26 +194,51 @@ class PhysicsAwareAttentionPooling(nn.Module):
         # 构造 forbidden_mask 来控制合并规则
         forbidden_mask = torch.zeros_like(logits, dtype=torch.bool)
         
-        # 规则 1：控制点不能分配给别人 (即控制点所在的行，除了自己，其他都是 True)
-        is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
-        forbidden_mask[is_control, :] = True
+        # 规则 1：控制点不能分配给别人 - 已注释，规则 5 已经隐含此约束
+        # is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
+        # forbidden_mask[is_control, :] = True
         
-        # 规则 2：别人不能分配给控制点 (即控制点所在的列，除了自己，其他都是 True)
-        forbidden_mask[:, is_control] = True
+        # 规则 2：别人不能分配给控制点 - 已注释，规则 5 已经隐含此约束
+        # forbidden_mask[:, is_control] = True
         
-        # 规则 3：只有邻居点才可以合并 (adj_mask[i,j] == 0 表示不是邻居，不能合并)
-        if adj_mask is not None:
-            # adj_mask 为 0 的位置表示不是邻居，这些位置不能合并
-            non_neighbor_mask = (adj_mask == 0)
-            forbidden_mask = forbidden_mask | non_neighbor_mask
+        # 规则 3：找到与 controller node 连接的节点，这些节点也不能与其他点合并 - 已注释，规则 5 已经隐含此约束
+        # controller_neighbor_mask = torch.zeros(N, dtype=torch.bool, device=logits.device)
+        # if adj_mask is not None and gs.shape[1] > 0:
+        #     control_indices = torch.where(is_control)[0]
+        #     for ctrl_idx in control_indices:
+        #         neighbors_of_controller = adj_mask[ctrl_idx]
+        #         controller_neighbor_mask = controller_neighbor_mask | neighbors_of_controller
+        #     controller_neighbor_mask = controller_neighbor_mask & (~is_control)
         
-        # 规则 4：只有 node_type 相同的点才可以合并
+        # 规则 3a：与 controller 连接的节点不能分配给其他非邻居节点 - 已注释，规则 5 已经隐含此约束
+        # if adj_mask is not None:
+        #     for i in range(N):
+        #         if controller_neighbor_mask[i]:
+        #             non_neighbors_of_i = ~adj_mask[i]
+        #             forbidden_mask[i, non_neighbors_of_i] = True
+        
+        # 规则 3b：其他节点也不能分配给与 controller 连接的节点 - 已注释，规则 5 已经隐含此约束
+        # for j in range(N):
+        #     if controller_neighbor_mask[j]:
+        #         non_neighbors_of_j = ~adj_mask[:, j]
+        #         forbidden_mask[non_neighbors_of_j, j] = True
+        
+        # 规则 4：只有 node_type 相同的点才可以合并 - 已注释，规则 5 已经隐含此约束
         # 构造一个矩阵，其中 [i,j] 为 True 表示 node_type[i] != node_type[j]
-        node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
-        type_diff_mask = node_type_1d.unsqueeze(0) != node_type_1d.unsqueeze(1)  # (N, N)
-        forbidden_mask = forbidden_mask | type_diff_mask
+        # node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
+        # type_diff_mask = node_type_1d.unsqueeze(0) != node_type_1d.unsqueeze(1)  # (N, N)
+        # forbidden_mask = forbidden_mask | type_diff_mask
+        # 注：规则 5 已经隐含了此约束，因为两个 object point 的 type 必然相同（都是 0）
         
-        # 规则 5：允许所有点（包括控制点）分配给自己 (对角线始终允许)
+        # 规则 5：只有 object point (node_type == 0) 可以合并，其他点都不可以合并
+        # 构造一个矩阵，其中 [i,j] 为 True 表示 i 或 j 不是 object point
+        node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
+        is_object = (node_type_1d == 0)  # (N,) - True for object points
+        # 如果 i 或 j 不是 object point，则不允许合并
+        not_both_object = ~(is_object.unsqueeze(0) & is_object.unsqueeze(1))  # (N, N)
+        forbidden_mask = forbidden_mask | not_both_object
+        
+        # 规则 6：允许所有点（包括控制点）分配给自己 (对角线始终允许)
         diag_indices = torch.arange(N, device=logits.device)
         forbidden_mask[diag_indices, diag_indices] = False 
         
@@ -244,18 +279,22 @@ class PhysicsAwareAttentionPooling(nn.Module):
         A_new = P_proj.transpose(-1, -2) @ A_orig @ P_proj
         A_new.fill_diagonal_(0.0)
         
+        # 将 A_new 转换为右上半角矩阵（只保留上三角部分）
+        A_new = torch.triu(A_new, diagonal=1)
+        
         src, dst = torch.where(A_new > 0)
-        gs = torch.stack([src, dst], dim=0) 
+        gs = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0) 
 
         # --- Step 8: 物理系统降阶与 Loss 计算 ---
         # 直接用 P_proj 的转置去乘质量向量
         # (..., r, N) @ (..., N, 1) -> (..., r, 1)
         node_mass_hat = node_mass @ P_proj
+
         node_type_hat = node_type[:, active_mask]
 
         # (修复) lambda_reg 现已通过 self 访问
         intra_cluster_loss = torch.trace(P_proj.transpose(-1, -2) @ D_mat @ P_proj)
-        total_loss = intra_cluster_loss + self.lambda_reg * r_soft
+        total_loss = (intra_cluster_loss  + self.lambda_reg * r_soft) / N
         
         ids = torch.where(active_mask)[0].cpu().numpy().tolist()
 
@@ -514,7 +553,7 @@ class End2EndReduction(EvoMesh):
         tensor = node_mask[None, :, None].float() * tensor
         return tensor[:, node_mask]
 
-    def forward(self, node_in, m_ids, m_gs, m_pos, m_mass, m_type, temp=0.1, m_proj=None):
+    def forward(self, node_in, m_ids, m_gs, m_pos, m_mass, m_type, temp=0.1, m_proj=None, object_radius=None):
         """
         使用 PhysicsAwareAttentionPooling 进行内部下采样的前向传播。
         流程：先 pool -> down_gmps -> edge conv -> PhysicsAwareAttentionPooling 获取下采样的 gs, proj 等
@@ -528,7 +567,8 @@ class End2EndReduction(EvoMesh):
             m_node_mass: 每层节点质量列表
             m_node_type: 每层节点类型列表
             temp: Gumbel-softmax 温度参数
-            adj_mask: 邻接掩码，shape (N, N)，可选
+            m_proj: 投影矩阵列表，可选
+            object_radius: 物体半径阈值，当两个点之间的距离大于此值时，不允许合并这两个点
         """
         down_ids = []
         down_gs = []
@@ -543,7 +583,6 @@ class End2EndReduction(EvoMesh):
         # 确保输入有 batch 维度
         if node_in.dim() == 2:
             node_in = node_in[None, ...]  # (1, N, F)
-        
         
         # down pass
         ds_edge_embedding = []
@@ -564,7 +603,7 @@ class End2EndReduction(EvoMesh):
                 self.down_gmps[i](node_in, gs, pos, 
                                     node_type=node_type, 
                                     node_mass=node_mass)
-            
+
             # Step 3: edge conv - 使用边卷积更新节点特征
             node_in = self.edge_conv(node_in, gs, ew)
 
@@ -573,16 +612,16 @@ class End2EndReduction(EvoMesh):
             cts.append(ew)
             
             # Step 4: PhysicsAwareAttentionPooling - 获取下采样的 gs, proj 等
-            if not m_proj:
+            if ((i+1) > len(m_proj)):
                 idx, gs, node_in, pos, node_mass, node_type, pool_loss, dynamic_r, P_proj =\
                     self.downpools[i](
                         node_in, pos, node_mass, node_type, gs, 
-                        tau=temp)
+                        tau=temp, object_radius=object_radius)
             else:
                 idx, gs, node_in, pos, node_mass, node_type, pool_loss, dynamic_r, P_proj =\
                     self.downpools[i](
                         node_in, pos, node_mass, node_type, gs, 
-                        temp, m_proj[i])
+                        temp, m_proj[i], object_radius=object_radius)
                 
             down_ids.append(idx)
             down_gs.append(gs)
@@ -608,6 +647,7 @@ class End2EndReduction(EvoMesh):
             up_idx = self.l_n - i - 1
             # 使用 downpools 生成的 gs 进行 up pass
             gs = down_gs[up_idx] 
+            num_edge = gs.shape[1]
 
             node_in = self.unpools[i](node_in, 
                                       down_outs[up_idx].shape[-2], 
@@ -626,13 +666,12 @@ class End2EndReduction(EvoMesh):
             node_in = node_in + down_outs[up_idx]
 
             edge_embedding = edge_embedding + ds_edge_embedding[up_idx]            
-            num_edge = edge_embedding.shape[1]
 
             # Average symmetric edges
             edge_feature = edge_embedding[:, :num_edge//2] + edge_embedding[:, num_edge//2:]
             mlvl_edge_embedding.insert(0, edge_feature)
         
-        down_ids.insert(0, [x for x in range(node_in.shape[1])])
+        down_ids.insert(0, m_ids[0])
         # Return downsample results for warp construction
         downsample_results = {
             'down_ids': down_ids,
@@ -642,5 +681,5 @@ class End2EndReduction(EvoMesh):
             'down_mass': down_mass,
             'down_type': down_type,
         }
-        
+
         return mlvl_edge_embedding, pooling_losses, downsample_results

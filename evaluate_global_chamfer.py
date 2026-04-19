@@ -79,7 +79,9 @@ def load_global_trajectory(dir_name):
     
     返回：vertices (所有 level 的列表), masses, edges, gt_indices
     """
-    traj_path = f"{dir_name}/trajectories/global_best_trajectory.pkl"
+    lastest_timestamp = sorted(os.listdir(dir_name))[-1]
+
+    traj_path = f"{dir_name}/{lastest_timestamp}/trajectories/global_best_trajectory.pkl"
     
     if not os.path.exists(traj_path):
         print(f"Warning: Global trajectory file not found: {traj_path}")
@@ -334,8 +336,30 @@ def visualize_global_trajectory(case_name, vertices, gt_object_points, gt_visibi
     print(f"Starting global best trajectory visualization for {case_name}...")
     print(f"Number of levels: {len(vertices)}")
     
-    # Create figure with multiple subplots (one for each level + GT)
+    # 过滤掉含有 nan 的 level，只保留正常的 level 进行可视化
+    valid_vertices = []
+    valid_level_indices = []
+    for level_idx, level_vertices in enumerate(vertices):
+        if isinstance(level_vertices, np.ndarray):
+            has_nan = np.isnan(level_vertices).any()
+        else:
+            has_nan = torch.isnan(level_vertices).any().item()
+        
+        if has_nan:
+            print(f"Level {level_idx} contains NaN vertices, skipping visualization")
+        else:
+            valid_vertices.append(level_vertices)
+            valid_level_indices.append(level_idx)
+    
+    # 使用过滤后的 vertices
+    vertices = valid_vertices
     num_levels = len(vertices)
+    
+    if num_levels == 0:
+        print("No valid levels to visualize (all levels contain NaN)")
+        return None
+    
+    # Create figure with multiple subplots (one for each level + GT)
     fig, axes = plt.subplots(1, num_levels + 1, figsize=(4 * (num_levels + 1), 8), subplot_kw={'projection': '3d'})
     
     if num_levels == 0:
@@ -401,7 +425,6 @@ def visualize_global_trajectory(case_name, vertices, gt_object_points, gt_visibi
         # Save frame
         frame_path = os.path.join(temp_images_dir, f'frame_{t:05d}.png')
         plt.savefig(frame_path, dpi=100, bbox_inches='tight')
-    
     plt.close(fig)
     
     # Convert images to video
@@ -427,7 +450,7 @@ def _images_to_video(images_dir, output_path):
     height, width = first_frame.shape[:2]
     
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), 
-                             30, (width, height))
+                             10, (width, height))
     
     for image_file in tqdm(image_files, desc="Creating video"):
         image_path = os.path.join(images_dir, image_file)

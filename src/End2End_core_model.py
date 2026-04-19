@@ -267,7 +267,7 @@ class End2End(EvoMesh):
         new_edge_parent[:len(original_valid)] = torch.arange(num_orignal_edge, dtype=torch.long, device=g.device).unsqueeze(-1)[original_valid]
         return new_g, new_edge_parent
 
-    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, temp=0.1):
+    def forward(self, node_in, edge_mech_in, mm_ids, mm_gs, mm_gs_parent, pos, node_type=None, temp=0.1):
         # node_in is in shape of (T), N, F
         # if edge_set_num>1, then m_g is in shape: Level,(Set),2,Edges, the 0th Set is main/material graph
         # pos is in (T),N,D
@@ -335,6 +335,18 @@ class End2End(EvoMesh):
 
                 m_idx = (y_hard[..., 0] == 1).nonzero().unique()
                 num_original_edge = edge_index.shape[1]
+                
+                # 只有 object point (node_type == 0) 可以合并，其他点都不可以合并
+                if node_type is not None:
+                    node_type_1d = node_type[0] if node_type.dim() > 1 else node_type
+                    # 获取边两端的节点类型
+                    edge_src_type = node_type_1d[edge_index[0]]
+                    edge_dst_type = node_type_1d[edge_index[1]]
+                    # 只有两端都是 object point 的边才可以被合并
+                    both_object = (edge_src_type == 0) & (edge_dst_type == 0)
+                    # 过滤 m_idx，只保留两端都是 object point 的边
+                    m_idx_object = m_idx[both_object[m_idx]]
+                    m_idx = m_idx_object
 
                 g, gs_parent_new = self.pool_edge(edge_index2, m_idx, num_nodes, num_original_edge)
                 g, gs_parent_new = coalesce(g, gs_parent_new, num_nodes=len(m_idx), reduce='max')

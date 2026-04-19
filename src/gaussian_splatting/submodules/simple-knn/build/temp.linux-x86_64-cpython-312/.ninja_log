@@ -1,0 +1,4 @@
+# ninja log v7
+1	10051	1776138923318860857	/root/autodl-tmp/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/simple_knn.o	24920051a58682da
+0	14443	1776138923318860857	/root/autodl-tmp/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/ext.o	f4ee2cdbf7c33d21
+1	35076	1776138923318860857	/root/autodl-tmp/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/spatial.o	f0e241d7cc5391a0

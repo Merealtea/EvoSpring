@@ -40,16 +40,17 @@ class LevelVisualizer:
                                    level_idx,
                                    gt_vertices, 
                                    pred_vertices,
+                                   edges=None,
                                    output_filename=None,
                                    title_prefix=""):
         """
-        Visualize ground truth vs prediction for a single level (point cloud only).
+        Visualize ground truth vs prediction for a single level (with edges).
         
         Args:
             level_idx: Level index
             gt_vertices: Ground truth vertices [T, N, 3]
             pred_vertices: Predicted vertices [T, N, 3]
-            edges: Edge connectivity (ignored, for compatibility)
+            edges: Edge connectivity [2, num_edges] (optional)
             output_filename: Output video filename (optional)
             title_prefix: Prefix for title
             
@@ -80,9 +81,15 @@ class LevelVisualizer:
             ax1.clear()
             ax2.clear()
             
-            # Create new point clouds
+            # Create new point clouds and edges for GT
             self._create_point_cloud(ax1, gt_vertices[t], 'Ground Truth', 'green')
+            if edges is not None:
+                self._create_edges(ax1, gt_vertices[t], edges, 'green')
+            
+            # Create new point clouds and edges for Pred
             self._create_point_cloud(ax2, pred_vertices[t], 'Prediction', 'blue')
+            if edges is not None:
+                self._create_edges(ax2, pred_vertices[t], edges, 'blue')
             
             # Set titles and axis limits (use same limits for both axes)
             ax1.set_title(f'Ground Truth (Frame {t})')
@@ -136,6 +143,65 @@ class LevelVisualizer:
             artists.append(scatter)
         except Exception as e:
             logger.warning(f"Failed to plot point cloud: {e}")
+        
+        return artists
+    
+    def _create_edges(self, ax, vertices, edges, color, alpha=0.3, linewidth=0.5):
+        """
+        Create edge lines between connected nodes.
+        
+        Args:
+            ax: Matplotlib axis
+            vertices: Vertex positions [N, 3]
+            edges: Edge connectivity [2, num_edges]
+            color: Color for the edges
+            alpha: Transparency of edges
+            linewidth: Line width for edges
+            
+        Returns:
+            List of matplotlib line artists
+        """
+        vertices = vertices.detach().cpu().numpy() if isinstance(vertices, torch.Tensor) else vertices
+        edges = edges.detach().cpu().numpy() if isinstance(edges, torch.Tensor) else edges
+        
+        artists = []
+        
+        # Check if edges is valid
+        if edges is None or len(edges) == 0:
+            return artists
+        
+        # edges shape: [2, num_edges], need to transpose to [num_edges, 2]
+        if len(edges.shape) == 2 and edges.shape[0] == 2:
+            edges = edges.T
+        
+        try:
+            if ax.name == '3d':
+                # Plot each edge as a line segment
+                for edge in edges:
+                    if len(edge) >= 2:
+                        i, j = int(edge[0]), int(edge[1])
+                        if 0 <= i < len(vertices) and 0 <= j < len(vertices):
+                            line = ax.plot(
+                                [vertices[i, 0], vertices[j, 0]],
+                                [vertices[i, 1], vertices[j, 1]],
+                                [vertices[i, 2], vertices[j, 2]],
+                                c=color, alpha=alpha, linewidth=linewidth
+                            )
+                            artists.extend(line)
+            else:
+                # 2D plot
+                for edge in edges:
+                    if len(edge) >= 2:
+                        i, j = int(edge[0]), int(edge[1])
+                        if 0 <= i < len(vertices) and 0 <= j < len(vertices):
+                            line = ax.plot(
+                                [vertices[i, 0], vertices[j, 0]],
+                                [vertices[i, 1], vertices[j, 1]],
+                                c=color, alpha=alpha, linewidth=linewidth
+                            )
+                            artists.extend(line)
+        except Exception as e:
+            logger.warning(f"Failed to plot edges: {e}")
         
         return artists
     
@@ -405,15 +471,21 @@ def visualize_level_results(trainer,
         
         # Check if shapes match for trajectory error visualization
         shapes_match = (gt_vertices.shape == pred_vertices_filtered.shape)
-        import pdb; pdb.set_trace()
         if not shapes_match:
             logger.warning(f"Level {level_idx}: GT shape {gt_vertices.shape} != Pred shape {pred_vertices_filtered.shape}, skipping trajectory error visualization")
-        import pdb; pdb.set_trace()
-        # Create comparison video (point cloud only, no edges)
+        
+        # Get edges for this level from trainer
+        edges = None
+        if level_idx < len(trainer.m_gs):
+            edges = trainer.m_gs[level_idx]
+            logger.info(f"Level {level_idx}: Using edges with shape {edges.shape}")
+        
+        # Create comparison video with edges
         video_path = visualizer.visualize_level_comparison(
             level_idx=level_idx,
             gt_vertices=gt_vertices,
             pred_vertices=pred_vertices_filtered,
+            edges=edges,
             output_filename=f"level_{level_idx}_comparison.mp4",
             title_prefix=f"Level {level_idx}"
         )

@@ -672,6 +672,9 @@ class SpringMassSystemWarp:
         gt_object_points=None,
         gt_object_visibilities=None,
         gt_object_motions_valid=None,
+        # 新增：未下采样的真值，用于 chamfer loss 计算
+        gt_object_points_full=None,
+        gt_object_visibilities_full=None,
         self_collision=False,
         disable_backward=False,
     ):
@@ -758,13 +761,26 @@ class SpringMassSystemWarp:
             )
 
         # Initialize the GT for calculating losses
+        # 下采样后的真值用于 track loss
         self.gt_object_points = gt_object_points
         if cfg.data_type == "real":
             self.gt_object_visibilities = gt_object_visibilities.int()
             self.gt_object_motions_valid = gt_object_motions_valid.int()
-
+        
         self.num_surface_points = num_surface_points
         self.num_original_points = num_original_points
+
+        # 未下采样的真值用于 chamfer loss（如果提供了的话）
+        self.gt_object_points_full = gt_object_points_full
+        self.use_full_gt_for_chamfer = (gt_object_points_full is not None)
+        if cfg.data_type == "real" and self.use_full_gt_for_chamfer:
+            self.gt_object_visibilities_full = gt_object_visibilities_full.int()
+            self.num_original_points_full = gt_object_points_full.shape[1]
+        else:
+            self.gt_object_visibilities_full = None
+            self.num_original_points_full = self.num_original_points
+
+        
         if num_original_points is None:
             self.num_original_points = self.num_object_points
 
@@ -798,6 +814,18 @@ class SpringMassSystemWarp:
             )
             self.num_valid_visibilities = int(self.gt_object_visibilities[1].sum())
             self.num_valid_motions = int(self.gt_object_motions_valid[0].sum())
+            
+            # 如果提供了 full GT，也初始化对应的 buffer
+            if self.use_full_gt_for_chamfer:
+                self.wp_current_object_points_full = wp.from_torch(
+                    self.gt_object_points_full[1].clone(), dtype=wp.vec3, requires_grad=False
+                )
+                self.wp_current_object_visibilities_full = wp.from_torch(
+                    self.gt_object_visibilities_full[1].clone(),
+                    dtype=wp.int32,
+                    requires_grad=False,
+                )
+                self.num_valid_visibilities_full = int(self.gt_object_visibilities_full[1].sum())
 
             self.wp_original_control_point = wp.from_torch(
                 self.controller_points[0].clone(), dtype=wp.vec3, requires_grad=False
@@ -817,12 +845,21 @@ class SpringMassSystemWarp:
             state = State(self.wp_init_velocities, self.num_control_points)
             self.wp_states.append(state)
         if cfg.data_type == "real":
+            # 用于 track loss 的 distance matrix（下采样后的 GT）
             self.distance_matrix = wp.zeros(
                 (self.num_original_points, self.num_surface_points), requires_grad=False
             )
             self.neigh_indices = wp.zeros(
                 (self.num_original_points), dtype=wp.int32, requires_grad=False
             )
+            # 如果提供了 full GT，也初始化对应的 buffer 用于 chamfer loss
+            if self.use_full_gt_for_chamfer:
+                self.distance_matrix_full = wp.zeros(
+                    (self.num_original_points_full, self.num_surface_points), requires_grad=False
+                )
+                self.neigh_indices_full = wp.zeros(
+                    (self.num_original_points_full), dtype=wp.int32, requires_grad=False
+                )
 
         # Parameter to be optimized
         self.wp_spring_Y = wp.from_torch(
@@ -913,13 +950,22 @@ class SpringMassSystemWarp:
             )
 
         if not pure_inference:
-            # Set the target points
+            # Set the target points for track loss (downsampled GT)
             wp.launch(
                 copy_vec3,
                 dim=self.num_original_points,
                 inputs=[self.gt_object_points[frame_idx]],
                 outputs=[self.wp_current_object_points],
             )
+
+            # 如果提供了 full GT，也更新用于 chamfer loss 的 full GT
+            if self.use_full_gt_for_chamfer:
+                wp.launch(
+                    copy_vec3,
+                    dim=self.num_original_points_full,
+                    inputs=[self.gt_object_points_full[frame_idx]],
+                    outputs=[self.wp_current_object_points_full],
+                )
 
             if cfg.data_type == "real":
                 wp.launch(
@@ -941,6 +987,18 @@ class SpringMassSystemWarp:
                 self.num_valid_motions = int(
                     self.gt_object_motions_valid[frame_idx - 1].sum()
                 )
+                
+                # 更新 full GT 的 visibility
+                if self.use_full_gt_for_chamfer:
+                    wp.launch(
+                        copy_int,
+                        dim=self.num_original_points_full,
+                        inputs=[self.gt_object_visibilities_full[frame_idx]],
+                        outputs=[self.wp_current_object_visibilities_full],
+                    )
+                    self.num_valid_visibilities_full = int(
+                        self.gt_object_visibilities_full[frame_idx].sum()
+                    )
 
     def set_controller_interactive(
         self, last_controller_interactive, controller_interactive
@@ -1130,41 +1188,75 @@ class SpringMassSystemWarp:
             )
 
     def calculate_loss(self):
-        # Compute the chamfer loss
-        # Precompute the distances matrix for the chamfer loss
-        wp.launch(
-            compute_distances,
-            dim=(self.num_original_points, self.num_surface_points),
-            inputs=[
-                self.wp_states[-1].wp_x,
-                self.wp_current_object_points,
-                self.wp_current_object_visibilities,
-            ],
-            outputs=[self.distance_matrix],
-        )
+        # 如果提供了 full GT，则使用 full GT 计算 chamfer loss，否则使用下采样的 GT
+        if self.use_full_gt_for_chamfer:
+            # 使用未下采样的真值计算 chamfer loss
+            wp.launch(
+                compute_distances,
+                dim=(self.num_original_points_full, self.num_surface_points),
+                inputs=[
+                    self.wp_states[-1].wp_x,
+                    self.wp_current_object_points_full,
+                    self.wp_current_object_visibilities_full,
+                ],
+                outputs=[self.distance_matrix_full],
+            )
 
-        wp.launch(
-            compute_neigh_indices,
-            dim=self.num_original_points,
-            inputs=[self.distance_matrix],
-            outputs=[self.neigh_indices],
-        )
+            wp.launch(
+                compute_neigh_indices,
+                dim=self.num_original_points_full,
+                inputs=[self.distance_matrix_full],
+                outputs=[self.neigh_indices_full],
+            )
 
-        wp.launch(
-            compute_chamfer_loss,
-            dim=self.num_original_points,
-            inputs=[
-                self.wp_states[-1].wp_x,
-                self.wp_current_object_points,
-                self.wp_current_object_visibilities,
-                self.num_valid_visibilities,
-                self.neigh_indices,
-                cfg.chamfer_weight,
-            ],
-            outputs=[self.chamfer_loss],
-        )
+            wp.launch(
+                compute_chamfer_loss,
+                dim=self.num_original_points_full,
+                inputs=[
+                    self.wp_states[-1].wp_x,
+                    self.wp_current_object_points_full,
+                    self.wp_current_object_visibilities_full,
+                    self.num_valid_visibilities_full,
+                    self.neigh_indices_full,
+                    cfg.chamfer_weight,
+                ],
+                outputs=[self.chamfer_loss],
+            )
+        else:
+            # 使用下采样后的真值计算 chamfer loss
+            wp.launch(
+                compute_distances,
+                dim=(self.num_original_points, self.num_surface_points),
+                inputs=[
+                    self.wp_states[-1].wp_x,
+                    self.wp_current_object_points,
+                    self.wp_current_object_visibilities,
+                ],
+                outputs=[self.distance_matrix],
+            )
 
-        # Compute the tracking loss
+            wp.launch(
+                compute_neigh_indices,
+                dim=self.num_original_points,
+                inputs=[self.distance_matrix],
+                outputs=[self.neigh_indices],
+            )
+
+            wp.launch(
+                compute_chamfer_loss,
+                dim=self.num_original_points,
+                inputs=[
+                    self.wp_states[-1].wp_x,
+                    self.wp_current_object_points,
+                    self.wp_current_object_visibilities,
+                    self.num_valid_visibilities,
+                    self.neigh_indices,
+                    cfg.chamfer_weight,
+                ],
+                outputs=[self.chamfer_loss],
+            )
+
+        # Compute the tracking loss - 始终使用下采样后的真值
         wp.launch(
             compute_track_loss,
             dim=self.num_original_points,
@@ -1215,6 +1307,10 @@ class SpringMassSystemWarp:
         if cfg.data_type == "real":
             self.distance_matrix.zero_()
             self.neigh_indices.zero_()
+            # 如果使用了 full GT，清理对应的 buffer
+            if self.use_full_gt_for_chamfer:
+                self.distance_matrix_full.zero_()
+                self.neigh_indices_full.zero_()
             self.chamfer_loss.zero_()
             self.track_loss.zero_()
             self.acc_loss.zero_()
