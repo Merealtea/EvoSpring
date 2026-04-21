@@ -195,48 +195,48 @@ class PhysicsAwareAttentionPooling(nn.Module):
         forbidden_mask = torch.zeros_like(logits, dtype=torch.bool)
         
         # 规则 1：控制点不能分配给别人 - 已注释，规则 5 已经隐含此约束
-        # is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
-        # forbidden_mask[is_control, :] = True
+        is_control = (node_type == control_node_type)[0]  # 找到所有控制点，形状 (N,)
+        forbidden_mask[is_control, :] = True
         
         # 规则 2：别人不能分配给控制点 - 已注释，规则 5 已经隐含此约束
-        # forbidden_mask[:, is_control] = True
+        forbidden_mask[:, is_control] = True
         
         # 规则 3：找到与 controller node 连接的节点，这些节点也不能与其他点合并 - 已注释，规则 5 已经隐含此约束
-        # controller_neighbor_mask = torch.zeros(N, dtype=torch.bool, device=logits.device)
-        # if adj_mask is not None and gs.shape[1] > 0:
-        #     control_indices = torch.where(is_control)[0]
-        #     for ctrl_idx in control_indices:
-        #         neighbors_of_controller = adj_mask[ctrl_idx]
-        #         controller_neighbor_mask = controller_neighbor_mask | neighbors_of_controller
-        #     controller_neighbor_mask = controller_neighbor_mask & (~is_control)
+        controller_neighbor_mask = torch.zeros(N, dtype=torch.bool, device=logits.device)
+        if adj_mask is not None and gs.shape[1] > 0:
+            control_indices = torch.where(is_control)[0]
+            for ctrl_idx in control_indices:
+                neighbors_of_controller = adj_mask[ctrl_idx]
+                controller_neighbor_mask = controller_neighbor_mask | neighbors_of_controller
+            controller_neighbor_mask = controller_neighbor_mask & (~is_control)
         
         # 规则 3a：与 controller 连接的节点不能分配给其他非邻居节点 - 已注释，规则 5 已经隐含此约束
-        # if adj_mask is not None:
-        #     for i in range(N):
-        #         if controller_neighbor_mask[i]:
-        #             non_neighbors_of_i = ~adj_mask[i]
-        #             forbidden_mask[i, non_neighbors_of_i] = True
+        if adj_mask is not None:
+            for i in range(N):
+                if controller_neighbor_mask[i]:
+                    non_neighbors_of_i = ~adj_mask[i]
+                    forbidden_mask[i, non_neighbors_of_i] = True
         
         # 规则 3b：其他节点也不能分配给与 controller 连接的节点 - 已注释，规则 5 已经隐含此约束
-        # for j in range(N):
-        #     if controller_neighbor_mask[j]:
-        #         non_neighbors_of_j = ~adj_mask[:, j]
-        #         forbidden_mask[non_neighbors_of_j, j] = True
+        for j in range(N):
+            if controller_neighbor_mask[j]:
+                non_neighbors_of_j = ~adj_mask[:, j]
+                forbidden_mask[non_neighbors_of_j, j] = True
         
         # 规则 4：只有 node_type 相同的点才可以合并 - 已注释，规则 5 已经隐含此约束
         # 构造一个矩阵，其中 [i,j] 为 True 表示 node_type[i] != node_type[j]
-        # node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
-        # type_diff_mask = node_type_1d.unsqueeze(0) != node_type_1d.unsqueeze(1)  # (N, N)
-        # forbidden_mask = forbidden_mask | type_diff_mask
+        node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
+        type_diff_mask = node_type_1d.unsqueeze(0) != node_type_1d.unsqueeze(1)  # (N, N)
+        forbidden_mask = forbidden_mask | type_diff_mask
         # 注：规则 5 已经隐含了此约束，因为两个 object point 的 type 必然相同（都是 0）
         
         # 规则 5：只有 object point (node_type == 0) 可以合并，其他点都不可以合并
         # 构造一个矩阵，其中 [i,j] 为 True 表示 i 或 j 不是 object point
-        node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
-        is_object = (node_type_1d == 0)  # (N,) - True for object points
-        # 如果 i 或 j 不是 object point，则不允许合并
-        not_both_object = ~(is_object.unsqueeze(0) & is_object.unsqueeze(1))  # (N, N)
-        forbidden_mask = forbidden_mask | not_both_object
+        # node_type_1d = node_type[0] if node_type.dim() > 1 else node_type  # (N,)
+        # is_object = (node_type_1d == 0)  # (N,) - True for object points
+        # # 如果 i 或 j 不是 object point，则不允许合并
+        # not_both_object = ~(is_object.unsqueeze(0) & is_object.unsqueeze(1))  # (N, N)
+        # forbidden_mask = forbidden_mask | not_both_object
         
         # 规则 6：允许所有点（包括控制点）分配给自己 (对角线始终允许)
         diag_indices = torch.arange(N, device=logits.device)

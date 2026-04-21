@@ -195,7 +195,7 @@ def write_results_to_csv(results):
                 ]
                 writer.writerow(row)
             
-            # 添加平均行
+            # 添加每个 case 内部所有 level 的平均行
             avg_row = [
                 case_name,
                 'AVG',
@@ -204,6 +204,40 @@ def write_results_to_csv(results):
                 case_result.get('avg_test_error', 'N/A')
             ]
             writer.writerow(avg_row)
+        
+        # 添加一个空行分隔
+        writer.writerow([])
+        
+        # 计算每一层所有 case 的平均值
+        writer.writerow(["Layer-wise Average across all cases"])
+        
+        # 找到最大的 level 数量
+        max_levels = max(len(case_result['levels']) for case_result in results)
+        
+        for level_idx in range(max_levels):
+            train_errors = []
+            test_errors = []
+            num_nodes_list = []
+            
+            for case_result in results:
+                if level_idx < len(case_result['levels']):
+                    level_result = case_result['levels'][level_idx]
+                    train_errors.append(level_result.get('train_track_error', 0))
+                    test_errors.append(level_result.get('test_track_error', 0))
+                    num_nodes_list.append(level_result.get('num_nodes', 0))
+            
+            avg_train_error = np.mean(train_errors) if train_errors else 0
+            avg_test_error = np.mean(test_errors) if test_errors else 0
+            avg_num_nodes = np.mean(num_nodes_list) if num_nodes_list else 0
+            
+            row = [
+                "Average",
+                level_idx,
+                f"{avg_num_nodes:.2f}",
+                f"{avg_train_error:.6f}",
+                f"{avg_test_error:.6f}"
+            ]
+            writer.writerow(row)
     
     print(f"\nResults saved to {output_file}")
 

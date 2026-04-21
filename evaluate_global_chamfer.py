@@ -297,7 +297,7 @@ def write_results_to_csv(results):
                 ]
                 writer.writerow(row)
             
-            # 添加平均行
+            # 添加每个 case 内部所有 level 的平均行
             avg_row = [
                 case_name,
                 'AVG',
@@ -308,6 +308,42 @@ def write_results_to_csv(results):
                 case_result.get('avg_test_error', 'N/A')
             ]
             writer.writerow(avg_row)
+        
+        # 添加一个空行分隔
+        writer.writerow([])
+        
+        # 计算每一层所有 case 的平均值
+        writer.writerow(["Layer-wise Average across all cases"])
+        
+        # 找到最大的 level 数量
+        max_levels = max(len(case_result['levels']) for case_result in results)
+        
+        for level_idx in range(max_levels):
+            train_errors = []
+            test_errors = []
+            num_nodes_list = []
+            
+            for case_result in results:
+                if level_idx < len(case_result['levels']):
+                    level_result = case_result['levels'][level_idx]
+                    train_errors.append(level_result.get('train_chamfer_error', 0))
+                    test_errors.append(level_result.get('test_chamfer_error', 0))
+                    num_nodes_list.append(level_result.get('num_nodes', 0))
+            
+            avg_train_error = np.mean(train_errors) if train_errors else 0
+            avg_test_error = np.mean(test_errors) if test_errors else 0
+            avg_num_nodes = np.mean(num_nodes_list) if num_nodes_list else 0
+            
+            row = [
+                "Average",
+                level_idx,
+                f"{avg_num_nodes:.2f}",
+                "N/A",
+                f"{avg_train_error:.6f}",
+                "N/A",
+                f"{avg_test_error:.6f}"
+            ]
+            writer.writerow(row)
     
     print(f"\nResults saved to {output_file}")
 
@@ -476,23 +512,23 @@ if __name__ == "__main__":
     results = evaluate_global_results()
     write_results_to_csv(results)
     
-    # Visualize global best trajectories for each case
-    print("\nGenerating trajectory visualizations...")
-    dir_names = glob.glob(f"{prediction_dir}/*")
-    for dir_name in dir_names:
-        case_name = dir_name.split("/")[-1]
-        print(f"\nVisualizing {case_name}...")
+    # # Visualize global best trajectories for each case
+    # print("\nGenerating trajectory visualizations...")
+    # dir_names = glob.glob(f"{prediction_dir}/*")
+    # for dir_name in dir_names:
+    #     case_name = dir_name.split("/")[-1]
+    #     print(f"\nVisualizing {case_name}...")
         
-        # Load GT data
-        with open(f"{base_path}/{case_name}/final_data.pkl", "rb") as f:
-            data = pickle.load(f)
+    #     # Load GT data
+    #     with open(f"{base_path}/{case_name}/final_data.pkl", "rb") as f:
+    #         data = pickle.load(f)
         
-        gt_object_points = data["object_points"]
-        gt_visibilities = data["object_visibilities"]
+    #     gt_object_points = data["object_points"]
+    #     gt_visibilities = data["object_visibilities"]
         
-        # Load and visualize global best trajectory
-        vertices, _, _, _ = load_global_trajectory(dir_name)
-        if vertices is not None:
-            visualize_global_trajectory(case_name, vertices, gt_object_points, gt_visibilities)
+    #     # Load and visualize global best trajectory
+    #     vertices, _, _, _ = load_global_trajectory(dir_name)
+    #     if vertices is not None:
+    #         visualize_global_trajectory(case_name, vertices, gt_object_points, gt_visibilities)
     
-    print("\nEvaluation and visualization completed!")
+    # print("\nEvaluation and visualization completed!")

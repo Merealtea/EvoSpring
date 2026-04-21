@@ -23,7 +23,7 @@ from qqtt.utils import cfg
 wp.init()
 wp.set_device("cuda:0")
 
-prediction_path = "./res/End2End_Reduction_backup/"
+prediction_path = "/mnt/pool1/cxy/phystwin-v2/real2sim-eval/log/Real2sim_Reduction"
 base_path = "./data/different_types/"
 output_file = "results/node_degree_analysis.csv"
 visualization_output_dir = "./visualization/node_degree/"
@@ -577,7 +577,7 @@ def load_all_data_from_mech_info(dir_name):
     if not os.path.exists(mech_info_path):
         print(f"Warning: mech_info file not found: {mech_info_path}")
         # 尝试备选路径
-        alt_mech_info_path = os.path.join(dir_name, 'spring_mech_info', 'global_best_mech_info.pth')
+        alt_mech_info_path = os.path.join(dir_name,'spring_mech_info', 'global_best_mech_info.pth')
         if os.path.exists(alt_mech_info_path):
             mech_info_path = alt_mech_info_path
             print(f"Trying alternative: {mech_info_path}")
@@ -585,8 +585,8 @@ def load_all_data_from_mech_info(dir_name):
             return None
     
     print(f"Loading all data from mech_info: {mech_info_path}")
-    mech_data = torch.load(mech_info_path, map_location='cpu')['mech']
-
+    mech_data = torch.load(mech_info_path, map_location='cpu')['mech'][0]
+    import pdb; pdb.set_trace()
     # mech_data 直接就是 dict，不需要处理 'mech' 键
     if not isinstance(mech_data, dict):
         print(f"Error: Unexpected mech_data format: {type(mech_data)}, expected dict")
@@ -1162,7 +1162,8 @@ def analyze_node_degree():
     
     dir_names = glob.glob(f"{prediction_path}/*")
     for dir_name in dir_names:
-        if 'double_lift_zebra' not in dir_name:
+        
+        if 'rope_0001' not in dir_name:
             continue
         
         case_name = dir_name.split("/")[-1]
@@ -1172,7 +1173,7 @@ def analyze_node_degree():
         
         # Load all data from mech_info (returns dict for single level)
         all_data = load_all_data_from_mech_info(dir_name)
-
+        import pdb; pdb.set_trace()
         if all_data is None or all_data.get('edges') is None:
             print(f"Skipping {case_name} due to missing edge data")
             continue
@@ -2196,7 +2197,7 @@ def run_warp_simulator_analysis():
     node_info_path = ""
     
     # 力学参数路径（训练好的模型参数）
-    mech_info_path = "/root/autodl-tmp/EvoSpring/res/End2End_Reduction_backup/double_lift_zebra/spring_mech_info/global_best_mech_info.pth"
+    mech_info_path = "/mnt/pool1/cxy/phystwin-v2/real2sim-eval/log/Real2sim_Reduction/sloth_0001/E2E/spring_mech_info/global_best_mech_info.pth"
     
     # 输出目录
     output_dir = "./visualization/warp_simulator_results/"

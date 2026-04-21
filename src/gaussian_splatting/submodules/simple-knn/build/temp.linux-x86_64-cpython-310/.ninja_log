@@ -1,0 +1,4 @@
+# ninja log v7
+0	11750	1776698491160370576	/mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	d6a0164ef08e8263
+0	19052	1776698491160370576	/mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	f3d47c8465564276
+1	57787	1776698491161366100	/mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	9ee021572ead5142

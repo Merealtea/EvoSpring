@@ -72,9 +72,9 @@ if __name__ == "__main__":
     args.consist_mesh = bool(args.consist_mesh)
     args.dump_dir = os.path.join(args.dump_dir, 'ours')
     print(args)
-    torch.cuda.set_device(args.local_rank)
-    torch.distributed.init_process_group(backend='nccl')
-    torch.distributed.barrier()
+    # torch.cuda.set_device(args.local_rank)
+    # torch.distributed.init_process_group(backend='nccl')
+    # torch.distributed.barrier()
 
     device = torch.device("cuda", args.local_rank)
     print("device", device)

@@ -59,9 +59,9 @@ class E2EReductionTrainer:
             dir = os.path.join(self.save_base_dir, subdir)
             os.makedirs(dir, exist_ok=True)
         
-        if dist.get_rank() == 0:
+        # if dist.get_rank() == 0:
             # SummaryWriter 保存到时间戳文件夹下的 log 目录
-            self.writer = SummaryWriter(os.path.join(self.save_base_dir, 'log'))
+        self.writer = SummaryWriter(os.path.join(self.save_base_dir, 'log'))
 
         self.total_update = 0
         self.reducer = FastAdaptiveNetworkReducer(num_modes=500)
@@ -243,12 +243,13 @@ class E2EReductionTrainer:
             default_collision_object_fric=init_collision_object_fric
         )
 
-        self.model = nn.parallel.DistributedDataParallel(
-            self.model.cuda(self.args.local_rank),
-            device_ids=[self.args.local_rank],
-            output_device=self.args.local_rank,
-            find_unused_parameters=True  # [关键修复] 允许部分参数不参与计算
-        )
+        self.model.to(self.args.local_rank)
+        # self.model = nn.parallel.DistributedDataParallel(
+        #     self.model.cuda(self.args.local_rank),
+        #     device_ids=[self.args.local_rank],
+        #     output_device=self.args.local_rank,
+        #     find_unused_parameters=True  # [关键修复] 允许部分参数不参与计算
+        # )
 
     def _create_dataset_offline(self, mode='train', stride=1):
         if mode == 'train':
@@ -684,7 +685,7 @@ class E2EReductionTrainer:
         # 分阶段训练
         for stage in range(self.num_stages):
             # DEBUG(CXY)
-            if stage >= 2:
+            if stage >= 1:
                 break
 
             self.current_stage = stage

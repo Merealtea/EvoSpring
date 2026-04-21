@@ -31,19 +31,22 @@ if not os.path.exists(base_path):
 
 dir_names = os.listdir(base_path)
 finished_cases = os.listdir(res_path)
-'single_clift_cloth_3', 'single_lift_rope',  'double_lift_zebra', 
-dir_names = ['double_lift_sloth', 'single_push_sloth'] # small batch test
-# dir_names = ['double_lift_zebra']
+
+# dir_names = ['double_lift_cloth_1', 'double_lift_cloth_3', 'rope_double_hand', 'single_lift_zebra', 'single_push_rope_4', 'single_lift_cloth_4', 'single_push_rope_1'] # small batch test
+# dir_names = ['single_clift_cloth_3']
+exclusive_cases = ['single_clift_cloth_3'] #, 'double_lift_cloth_1', 'double_stretch_sloth', 'single_lift_rope', 'double_lift_cloth_3', 'single_lift_cloth_3', 'rope_double_hand', 'double_lift_zebra', 'double_lift_sloth']
 for idx, case_name in enumerate(dir_names):
     # case_name = 'single_clift_cloth_3' # DEBUG
-
+    if case_name in exclusive_cases:
+        continue
+    
     print(f"Running case: {case_name}")
     # if case_name in finished_cases:
     #     print(f"Case {case_name} already finished, skipping.")
     #     continue
 
     os.system(
-        f"python -m torch.distributed.launch --nproc_per_node=1 --master_port=34626 src/spring_mass_main.py \
+        f"python src/spring_mass_main.py \
             -case {case} -space_dim {config['space_dim']} -local_rank {local_rank} \
             -n_train {config['n_train']} -n_valid {config['n_valid']} -n_test {config['n_test']} -time_len {config['time_len']} \
             -noise_level {config['noise_level']} \
