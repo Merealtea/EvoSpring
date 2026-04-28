@@ -281,45 +281,43 @@ def render_sets_multi_stage(
         output_dir: Output directory
         multi_stage_ctrl_pts_paths: Dictionary mapping stage_idx to control points pickle file path
     """
-    with torch.no_grad():
-        output_path = output_dir
+    with open(multi_stage_ctrl_pts_paths, "rb") as f:
+        mlvl_ctrl_pts = pickle.load(f)['vertices']  # (n_frames, n_ctrl_pts, 3) ndarray
 
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    for stage_idx, ctrl_pts in enumerate(mlvl_ctrl_pts):
+         with torch.no_grad():
+            output_path = output_dir
 
-        gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+            bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+            background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        # remove gaussians that are outside the mask
-        if remove_gaussians:
-            gaussians = remove_gaussians_with_mask(gaussians, scene.getTrainCameras())
+            gaussians = GaussianModel(dataset.sh_degree)
+            scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
-        # remove gaussians that are low opacity
-        gaussians = remove_gaussians_with_low_opacity(gaussians)
+            # remove gaussians that are outside the mask
+            if remove_gaussians:
+                gaussians = remove_gaussians_with_mask(gaussians, scene.getTrainCameras())
 
-        # remove gaussians that are far from the mesh
-        # gaussians = remove_gaussians_with_point_mesh_distance(gaussians, scene.mesh_sampled_points, dist_threshold=0.01)
+            # remove gaussians that are low opacity
+            gaussians = remove_gaussians_with_low_opacity(gaussians)
 
-        # Store initial gaussian states
-        xyz_0 = gaussians.get_xyz
-        rgb_0 = gaussians.get_features_dc.squeeze(1)
-        quat_0 = gaussians.get_rotation
-        opa_0 = gaussians.get_opacity
-        scale_0 = gaussians.get_scaling
+            # remove gaussians that are far from the mesh
+            # gaussians = remove_gaussians_with_point_mesh_distance(gaussians, scene.mesh_sampled_points, dist_threshold=0.01)
 
-        print(f"===== Number of gaussians: {gaussians.get_xyz.shape[0]}")
+            # Store initial gaussian states
+            xyz_0 = gaussians.get_xyz
+            rgb_0 = gaussians.get_features_dc.squeeze(1)
+            quat_0 = gaussians.get_rotation
+            opa_0 = gaussians.get_opacity
+            scale_0 = gaussians.get_scaling
 
-        # Multi-stage rendering: process each stage
-        gaussians_list_per_stage = {}
-        
+            print(f"===== Number of gaussians: {gaussians.get_xyz.shape[0]}")
+
+            # Multi-stage rendering: process each stage
+            gaussians_list_per_stage = {}
             
-        with open(multi_stage_ctrl_pts_paths, "rb") as f:
-            mlvl_ctrl_pts = pickle.load(f)['vertices']  # (n_frames, n_ctrl_pts, 3) ndarray
-
-
-        for stage_idx, ctrl_pts in enumerate(mlvl_ctrl_pts):
             ctrl_pts = torch.tensor(ctrl_pts, dtype=torch.float32, device="cuda")
-
+                
             print(f"===== Number of frames: {ctrl_pts.shape[0]}")
             print(f"===== Number of control points: {ctrl_pts.shape[1]}")
 
@@ -371,21 +369,21 @@ def render_sets_multi_stage(
             
             gaussians_list_per_stage[stage_idx] = gaussians_list
 
-        # Select views for rendering
-        views = scene.getTestCameras()
+            # Select views for rendering
+            views = scene.getTestCameras()
 
-        # Render all stages
-        render_set_multi_stage(
-            output_path,
-            name,
-            views,
-            gaussians_list_per_stage,
-            pipeline,
-            background,
-            dataset.train_test_exp,
-            separate_sh,
-            disable_sh=dataset.disable_sh,
-        )
+            # Render all stages
+            render_set_multi_stage(
+                output_path,
+                name,
+                views,
+                gaussians_list_per_stage,
+                pipeline,
+                background,
+                dataset.train_test_exp,
+                separate_sh,
+                disable_sh=dataset.disable_sh,
+            )
 
 
 if __name__ == "__main__":

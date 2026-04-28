@@ -15,7 +15,7 @@ import csv
 def img2tensor(img):
     img = np.array(img, dtype=np.float32) / 255.0  # Normalize to [0,1]
     img = img.transpose(2, 0, 1)  # Change shape from (H, W, C) to (C, H, W)
-    return torch.from_numpy(img).unsqueeze(0).cuda()
+    return torch.from_numpy(img).unsqueeze(0).to('cuda:1')
 
 
 def compute_iou(mask1, mask2):
@@ -102,7 +102,7 @@ def evaluate_multi_stage_render():
             human_mask_dir = os.path.join(human_mask_path, scene)
             
             # Load frame split info
-            with open(f"{root_data_dir}/split.json", 'r') as f:
+            with open(f"{render_path_dir}/split.json", 'r') as f:
                 info = json.load(f)
             frame_len = info['frame_len']
             train_f_idx_range = list(range(info["train"][0] + 1, info["train"][1]))

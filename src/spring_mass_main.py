@@ -57,7 +57,7 @@ def getargs():
     parser.add_argument('-object_case', type=str, default=-1, help='target object for optimization')
     parser.add_argument('-train_frame', type=int, default=-1, help='frames used for mechanical info estimation')
     parser.add_argument('-test_frame', type=int, default=-1, help='frames used for mechanical info examination')
-
+    parser.add_argument('-reduction', type=str, help='Applicable Reduction Methods: learnable, reduction_order, random')
     args, _ = parser.parse_known_args()
     return args
 
@@ -77,9 +77,6 @@ if __name__ == "__main__":
     args.consist_mesh = bool(args.consist_mesh)
     args.dump_dir = os.path.join(args.dump_dir, args.object_case)
     print(args)
-    # torch.cuda.set_device(args.local_rank)
-    # torch.distributed.init_process_group(backend='nccl')
-    # torch.distributed.barrier()
 
     device = torch.device("cuda", args.local_rank)
 
@@ -109,8 +106,6 @@ if __name__ == "__main__":
     if MODE(args.mode) == MODE.Train:
         print('Train')
         trainer.train()
-        # trainer.test()
-        # trainer.rollout()
     elif MODE(args.mode) == MODE.Test:
         print('Test')
         trainer.test()

@@ -231,11 +231,11 @@ if __name__ == "__main__":
         args.pattern
     )
     
-    # Also create comparison video if multiple stages exist
-    create_comparison_video(
-        image_folder,
-        video_folder,
-        fps,
-        args.view,
-        args.pattern
-    )
+    # # Also create comparison video if multiple stages exist
+    # create_comparison_video(
+    #     image_folder,
+    #     video_folder,
+    #     fps,
+    #     args.view,
+    #     args.pattern
+    # )

@@ -1,15 +1,8 @@
 from models import ModelGeneral
 import torch
-from torch_geometric.utils import degree
 from End2End_reduction_model import End2EndReduction
-from core_model import MLP, gumbel_softmax
-from qqtt.model.diff_simulator import (
-    SpringMassSystemWarp,
-)
-import numpy as np
-import open3d as o3d
-import warp as wp
 from qqtt.utils import logger, cfg
+from core_model import MLP
 """
 This model works for mechanical information estimations of spring-mass systems.
 """
@@ -61,6 +54,10 @@ class End2EndReduction_EvoSpring(ModelGeneral):
             torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float32)).to(cfg.device) 
             for _ in range(layer_num)
         ])
+
+        self.spring_Y_basis = []
+        self.drag_damping_basis = []
+        self.dashpot_damping_basis = []
 
     def load_warp_simulator(self, simulator):
         self.simulator = simulator
@@ -123,7 +120,69 @@ class End2EndReduction_EvoSpring(ModelGeneral):
                     downsample_results[key][idx] = info[0]
         return mlvl_edge_feature, pooling_losses, downsample_results
     
-    def forward(self, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type, node_in, object_radius=None):
+    def calculate_proj_L_D(self, P, edge, prev_spring_Y, prev_dashpot_damping, prev_damping):
+
+        # ====================================================================
+        # 构建 L_hat, D_hat
+        # ====================================================================
+        # 提取上一层的投影矩阵 P 和 边索引
+        N_prev = P.shape[0]
+        u_prev = edge[0]
+        v_prev = edge[1]
+
+        prev_spring_Y = torch.cat([prev_spring_Y, prev_spring_Y]) # bidirection
+
+        # 1. 构造上一层的 L_prev
+        L_prev = torch.zeros((N_prev, N_prev), device=P.device, dtype=P.dtype)
+        L_prev[u_prev, v_prev] = -prev_spring_Y
+        
+        # 巧妙利用 scatter_add_ 快速计算 Laplacian 对角线（非对角线的相反数之和）
+        diag_L = torch.zeros(N_prev, device=P.device, dtype=P.dtype)
+        diag_L.scatter_add_(0, u_prev, prev_spring_Y)
+        L_prev[torch.arange(N_prev), torch.arange(N_prev)] = diag_L
+
+        # 2. 构造上一层的 D_prev
+        D_prev = torch.zeros((N_prev, N_prev), device=P.device, dtype=P.dtype)
+        
+        # --- 2.1 相对阻尼 (Dashpot) -> 拉普拉斯形式 ---
+        if prev_dashpot_damping.numel() == 1:
+            dashpot_vec = prev_dashpot_damping.expand(u_prev.size(0))
+        else:
+            dashpot_vec = prev_dashpot_damping
+            
+        D_prev[u_prev, v_prev] = -dashpot_vec
+        
+        diag_dashpot = torch.zeros(N_prev, device=P.device, dtype=P.dtype)
+        diag_dashpot.scatter_add_(0, u_prev, dashpot_vec)
+
+        # --- 2.2 绝对阻尼 (Drag) -> 纯对角线形式 ---
+        if prev_damping.numel() == 1:
+            drag_vec = prev_damping.expand(N_prev)
+        else:
+            drag_vec = prev_damping
+
+        # Dashpot 的对角线加上 Drag 作为总阻尼对角线
+        D_prev[torch.arange(N_prev), torch.arange(N_prev)] = diag_dashpot + drag_vec
+
+        # ====================================================================
+        # 3. [新增] 提取真正的 N x K 降维投影矩阵
+        # ====================================================================
+        # P 目前是 N x N，列和大于 0 的列即为被保留下来的代表节点
+        # 使用 torch.nonzero 找到这些有效列的索引
+        active_cols = torch.nonzero(P.sum(dim=0) > 0).squeeze(-1)
+        
+        # 提取出一个形状为 N x K 的投影矩阵
+        P_reduced = P[:, active_cols]
+
+        # ====================================================================
+        # 4. 伽辽金投影得到本层的 L_hat 和 D_hat (此时为 K x K)
+        # ====================================================================
+        L_hat = P_reduced.T @ L_prev @ P_reduced
+        D_hat = P_reduced.T @ D_prev @ P_reduced
+
+        return L_hat, D_hat
+
+    def forward(self, m_idx, m_gs, m_proj, m_node_pos, m_node_mass, m_node_type, node_in, object_radius=None, prev_best_mech_info=None):
         if self.temp > 0.1 :
             self.temp *= self.gamma
             self.temp = torch.clamp(self.temp, 0.1)
@@ -138,21 +197,42 @@ class End2EndReduction_EvoSpring(ModelGeneral):
 
         for lvl, edge_feature in enumerate(mlvl_edge_feature):
             # edge_feature shape: (1, M, C)
-            M = edge_feature.shape[1]
-            
             edge_mech_in_bias = self.edge_decode[lvl](edge_feature)[0, :, 0]  # shape: (M,)
+            
+            if lvl > 0 and lvl <= len(prev_best_mech_info):
+                prev_spring_Y = torch.exp(prev_best_mech_info[lvl-1]["log_spring_Y"])
+                prev_damping = prev_best_mech_info[lvl-1]["drag_damping"]
+                prev_dashpot_damping = prev_best_mech_info[lvl-1]["dashpot_damping"]
 
-            s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
+                # 构建L_hat, D_hat
+                L_hat, D_hat = self.calculate_proj_L_D(downsample_results['down_proj'][lvl-1], downsample_results['down_gs'][lvl-1],
+                                                       prev_spring_Y, prev_dashpot_damping, prev_damping)
+
+                edges = downsample_results['down_gs'][lvl]
+                num_edges = edges.shape[1]
+                spring_Y_basis = -L_hat[edges[0], edges[1]][:num_edges//2]
+                dashpot_array = -D_hat[edges[0], edges[1]]
+                new_dashpot_basis = torch.mean(dashpot_array) 
+                drag_array = torch.sum(D_hat, axis=1)
+                new_drag_basis = torch.mean(drag_array)
+
+                # 将提取的参数转为 Tensor 保存
+                drag_damping_out = new_drag_basis + self.drag_damping_bias[lvl] * 100
+                dashpot_damping_out = new_dashpot_basis + self.dashpot_damping_bias[lvl] * 100
+                s_out = ((spring_Y_basis + edge_mech_in_bias * 1e3))
+
+            else:
+                # 2. predict drag_damping bias
+                # # Return spring stiffness and damping parameters (default + learnable bias)
+                drag_damping_out = self.drag_damping_0 + self.drag_damping_bias[lvl] * 100
+                dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias[lvl] * 100
+                s_out = ((self.S_0 + edge_mech_in_bias * 1e3))
+
             s_out = torch.clip(s_out, 1e-8, cfg.spring_Y_max)
             mlvl_s_out.append(s_out)
 
-            # 2. predict drag_damping bias
-            # # Return spring stiffness and damping parameters (default + learnable bias)
-            drag_damping_out = self.drag_damping_0 + self.drag_damping_bias[lvl] * 100
-            dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias[lvl] * 100
-
-            drag_damping_out = torch.clip(drag_damping_out, 1e-8, 20.0) 
-            dashpot_damping_out = torch.clip(dashpot_damping_out, 1e-8, 200.0) 
+            drag_damping_out = torch.clip(drag_damping_out, 1, 20.0) 
+            dashpot_damping_out = torch.clip(dashpot_damping_out, 10, 200.0) 
             mlvl_drag_damping_out.append(drag_damping_out)
             mlvl_dashpot_damping_out.append(dashpot_damping_out)
     

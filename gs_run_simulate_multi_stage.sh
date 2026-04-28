@@ -9,28 +9,20 @@ output_dir="./gaussian_output_dynamic"
 views=("0")
 
 # Scene names
-scenes=(
-    "double_lift_cloth_1"
-    "double_lift_cloth_3"
-    "double_lift_sloth"
-    "double_lift_zebra"
-    "double_stretch_sloth"
-    "double_stretch_zebra"
-    "rope_double_hand"
-    "single_lift_dinosor"
-    "single_lift_rope"
-    "single_lift_sloth"
-    "single_lift_zebra"
-    "single_push_rope"
-    "single_push_rope_1"
-    "single_push_rope_4"
-    "single_push_sloth"
-    "weird_package"
-)
+scenes=("double_lift_cloth_1" "double_lift_cloth_3" "double_lift_sloth" "double_lift_zebra"
+        "double_stretch_sloth" "double_stretch_zebra"
+        "rope_double_hand"
+        "single_clift_cloth_1" "single_clift_cloth_3"
+        "single_lift_cloth" "single_lift_cloth_1" "single_lift_cloth_3" "single_lift_cloth_4"
+        "single_lift_dinosor" "single_lift_rope" "single_lift_sloth" "single_lift_zebra"
+        "single_push_rope" "single_push_rope_1" "single_push_rope_4"
+        "single_push_sloth"
+        "weird_package")
 
+# scenes=("single_push_rope")
 # Experiment name (Gaussian model checkpoint)
 exp_name='init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0'
-
+method='End2End_Random'
 
 # Process each scene
 for scene_name in "${scenes[@]}"; do
@@ -45,7 +37,8 @@ for scene_name in "${scenes[@]}"; do
         -s ./data/gaussian_data/${scene_name} \
         -m ./gaussian_output/${scene_name}/${exp_name} \
         --name ${scene_name} \
-        --output_dir ${output_dir} 
+        --output_dir ${output_dir} \
+        --method ${method}
     
     # Convert each stage's rendered images to video
     for view_name in "${views[@]}"; do

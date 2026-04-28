@@ -8,6 +8,7 @@ from time import time
 import torch
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse.csgraph import connected_components
+from sklearn.cluster import AgglomerativeClustering
 
 def build_physical_matrices_sparse(m_vector, m_gs, Y_vector, d_dashpot, d_drag):
     """
@@ -46,6 +47,7 @@ def build_physical_matrices_sparse(m_vector, m_gs, Y_vector, d_dashpot, d_drag):
 
     return M_sparse, D_sparse, L_sparse
 
+
 class FastAdaptiveNetworkReducer:
     def __init__(self, distance_threshold='auto', num_modes=100):
         """
@@ -60,7 +62,6 @@ class FastAdaptiveNetworkReducer:
         n = len(m_vector)
         
         # 1. 识别节点角色
-        # node_type == 3 为 controller
         ctrl_indices = np.where(node_type == 3)[0]
         normal_indices = np.where(node_type != 3)[0]
         
@@ -71,7 +72,7 @@ class FastAdaptiveNetworkReducer:
             logging.warning("No normal nodes to reduce or system too small.")
             return np.eye(n), None, None, None
 
-        # 2. 构建物理矩阵 (使用你提供的 sparse 构建函数)
+        # 2. 构建物理矩阵
         M_sp, D_sp, L_sp = build_physical_matrices_sparse(m_vector, 
                                                           m_gs, 
                                                           spring_Y, 
@@ -79,20 +80,8 @@ class FastAdaptiveNetworkReducer:
                                                           d_drag)
 
         # =================================================================
-        # 3. 模态分析与投影空间计算 (全局系统分析)
+        # 3. 提取受力节点 (公共逻辑提前)
         # =================================================================
-        k_modes = min(self.num_modes, n - 2) 
-        eigenvalues, Phi = eigsh(L_sp, k=k_modes, M=M_sp, sigma=-1e-4, which='LM')
-        
-        # M-正交归一化
-        for i in range(k_modes):
-            norm = np.sqrt(Phi[:, i].T @ M_sp @ Phi[:, i])
-            if norm > 1e-12: Phi[:, i] /= norm
-
-        # =================================================================
-        # 4. Lyapunov 求解获取特征嵌入 Z
-        # =================================================================
-        # 识别受力节点 (与控制器相连的节点)
         u, v = m_gs[0], m_gs[1]
         connected_v = v[np.isin(u, ctrl_indices)]
         connected_u = u[np.isin(v, ctrl_indices)]
@@ -102,101 +91,150 @@ class FastAdaptiveNetworkReducer:
         m_inputs = len(target_nodes) if len(target_nodes) > 0 else 1
         if len(target_nodes) == 0: target_nodes = np.array([0])
 
-        F_r = Phi[target_nodes, :].T  
-        ones_n = np.ones((n, 1))
-        sigma_D = (ones_n.T @ D_sp @ ones_n)[0, 0]
-        ones_T_F = np.ones((1, m_inputs)) 
+        # =================================================================
+        # 4. 判断并计算特征嵌入 Z (全空间 Lyapunov vs 降维投影 Lyapunov)
+        # =================================================================
+        if n < 2 * self.num_modes:
+            # --- 不进行模态分解：直接在完整物理空间求解 Lyapunov ---
+            print(f"Node count ({n}) < 2*num_modes. Skipping eigsh, solving full-space Lyapunov.")
+            
+            # 构造未降维的系统矩阵 A_full (2n x 2n)
+            M_d = M_sp.diagonal()
+            M_inv = sp.diags(1.0 / M_d, format='csr')
+            Minv_L = (M_inv @ L_sp).toarray()
+            Minv_D = (M_inv @ D_sp).toarray()
+            
+            A_full = np.block([
+                [np.zeros((n, n)), np.eye(n)],
+                [-Minv_L, -Minv_D]
+            ])
+            
+            # 构造未降维的输入矩阵 B_full_eff
+            ones_n = np.ones((n, 1))
+            sigma_D = (ones_n.T @ D_sp @ ones_n)[0, 0]
+            ones_T_F = np.ones((1, m_inputs))
+            
+            F_full = np.zeros((n, m_inputs))
+            for i, idx in enumerate(target_nodes):
+                F_full[idx, i] = 1.0
+                
+            B_full_eff = np.block([
+                [-(1.0 / sigma_D) * ones_n @ ones_T_F],
+                [F_full]
+            ])
+            
+            # 求解全维 Lyapunov 方程
+            try:
+                P_tilde = solve_continuous_lyapunov(A_full - 1e-5 * np.eye(2 * n), -B_full_eff @ B_full_eff.T)
+            except Exception as e:
+                logging.error(f"Full-space Lyapunov failed: {e}")
+                import pdb; pdb.set_trace()
+                
+            # 全维 Gramian 修正与嵌入空间计算
+            nu_full_T = np.block([[ones_n.T @ D_sp, ones_n.T @ M_sp]])
+            beta_a = - (nu_full_T @ P_tilde @ nu_full_T.T)[0, 0] / (sigma_D ** 2)
+            Pi_full = np.block([
+                [ones_n @ ones_n.T, np.zeros((n, n))],
+                [np.zeros((n, n)), np.zeros((n, n))]
+            ])
+            P_gramian = P_tilde + beta_a * Pi_full
+            
+            P11 = P_gramian[:n, :n]
+            w, v_e = np.linalg.eigh(P11)
+            w[w < 0] = 0
+            C = v_e @ np.diag(np.sqrt(w))
+            Z = C  # 全空间下等价于 Phi=I_n，所以 Z = I * C = C
 
-        B_r_eff = np.block([
-            [-(1.0 / sigma_D) * (Phi.T @ ones_n) @ ones_T_F],
-            [F_r]
-        ])
+        else:
+            # --- 原有逻辑：进行模态分解，在低维空间求解 Lyapunov ---
+            k_modes = min(self.num_modes, n - 2) 
+            eigenvalues, Phi = eigsh(L_sp, k=k_modes, M=M_sp, sigma=-1e-4, which='LM')
+            
+            for i in range(k_modes):
+                norm = np.sqrt(Phi[:, i].T @ M_sp @ Phi[:, i])
+                if norm > 1e-12: Phi[:, i] /= norm
 
-        M_r = Phi.T @ M_sp @ Phi
-        D_r = Phi.T @ D_sp @ Phi
-        L_r = np.diag(eigenvalues)
-        
-        A_r = np.block([
-            [np.zeros((k_modes, k_modes)), np.eye(k_modes)],
-            [-np.linalg.inv(M_r) @ L_r, -np.linalg.inv(M_r) @ D_r]
-        ])
-        
-        P_r_tilde = solve_continuous_lyapunov(A_r - 1e-5 * np.eye(2 * k_modes), -B_r_eff @ B_r_eff.T)
-        
-        nu_r_T = np.block([[ones_n.T @ D_sp @ Phi, ones_n.T @ M_sp @ Phi]])
-        beta_a = - (nu_r_T @ P_r_tilde @ nu_r_T.T)[0, 0] / (sigma_D ** 2)
-        Pi_r = np.block([
-            [Phi.T @ ones_n @ ones_n.T @ Phi, np.zeros((k_modes, k_modes))],
-            [np.zeros((k_modes, k_modes)), np.zeros((k_modes, k_modes))]
-        ])
-        P_r_gramian = P_r_tilde + beta_a * Pi_r
+            F_r = Phi[target_nodes, :].T  
+            ones_n = np.ones((n, 1))
+            sigma_D = (ones_n.T @ D_sp @ ones_n)[0, 0]
+            ones_T_F = np.ones((1, m_inputs)) 
 
-        # 欧氏空间嵌入 Z (N x k)
-        P_r11 = P_r_gramian[:k_modes, :k_modes]
-        w, v_e = np.linalg.eigh(P_r11)
-        w[w < 0] = 0
-        C = v_e @ np.diag(np.sqrt(w))
-        Z = Phi @ C
+            B_r_eff = np.block([
+                [-(1.0 / sigma_D) * (Phi.T @ ones_n) @ ones_T_F],
+                [F_r]
+            ])
+
+            M_r = Phi.T @ M_sp @ Phi
+            D_r = Phi.T @ D_sp @ Phi
+            L_r = np.diag(eigenvalues)
+            
+            A_r = np.block([
+                [np.zeros((k_modes, k_modes)), np.eye(k_modes)],
+                [-np.linalg.inv(M_r) @ L_r, -np.linalg.inv(M_r) @ D_r]
+            ])
+            
+            try:
+                P_r_tilde = solve_continuous_lyapunov(A_r - 1e-5 * np.eye(2 * k_modes), -B_r_eff @ B_r_eff.T)
+            except:
+                import pdb; pdb.set_trace()
+                
+            nu_r_T = np.block([[ones_n.T @ D_sp @ Phi, ones_n.T @ M_sp @ Phi]])
+            beta_a = - (nu_r_T @ P_r_tilde @ nu_r_T.T)[0, 0] / (sigma_D ** 2)
+            Pi_r = np.block([
+                [Phi.T @ ones_n @ ones_n.T @ Phi, np.zeros((k_modes, k_modes))],
+                [np.zeros((k_modes, k_modes)), np.zeros((k_modes, k_modes))]
+            ])
+            P_r_gramian = P_r_tilde + beta_a * Pi_r
+
+            P_r11 = P_r_gramian[:k_modes, :k_modes]
+            w, v_e = np.linalg.eigh(P_r11)
+            w[w < 0] = 0
+            C = v_e @ np.diag(np.sqrt(w))
+            Z = Phi @ C
 
         # =================================================================
-        # 5. 限制性聚类逻辑：仅聚类 normal_indices，且只允许空间相连的节点合并
-        #    【新增约束】: 只合并 type 相同的点，并且不合并 controller points
+        # 5. 限制性聚类逻辑：仅聚类 normal_indices
         # =================================================================
-        # 提取普通节点的坐标嵌入
         Z_normal = Z[normal_indices, :]
-        
-        # 获取普通节点的 type
         normal_types = node_type[normal_indices]
-        
-        # 构建普通节点之间的邻接关系（只考虑 normal 节点之间的连接）- 使用矩阵运算
         n_nodes = len(normal_indices)
         
-        # 创建从全局索引到局部索引的映射数组
         global_to_local = np.full(n, -1, dtype=np.int32)
         global_to_local[normal_indices] = np.arange(n_nodes)
         
-        # 向量化过滤：只保留两端都是 normal nodes 的边
         u, v = m_gs[0], m_gs[1]
         u_local = global_to_local[u]
         v_local = global_to_local[v]
         
-        # 过滤掉自环和无效边（-1 表示不是 normal node）
         valid_mask = (u_local >= 0) & (v_local >= 0) & (u_local != v_local)
         u_local = u_local[valid_mask]
         v_local = v_local[valid_mask]
         
-        # 使用向量化聚类方法
         cluster_labels = self._constrained_hierarchical_clustering_vectorized(
             Z_normal, u_local, v_local, n_nodes, normal_types
         )
-        n_clusters_normal = len(np.unique(cluster_labels))
 
         # =================================================================
-        # 6. 构建混合投影矩阵 P (N x (n_clusters_normal + n_ctrl))
+        # 6. 构建 N x N 投影矩阵 P
         # =================================================================
-        # P 的形状为 [原始节点数, 压缩后节点数]
-        total_reduced_nodes = n_clusters_normal + n_ctrl
-        P = np.zeros((n, total_reduced_nodes))
+        P = np.zeros((n, n))
+        unique_labels = np.unique(cluster_labels)
+        
+        for label in unique_labels:
+            in_cluster_mask = (cluster_labels == label)
+            cluster_global_indices = normal_indices[in_cluster_mask]
+            
+            Z_cluster = Z[cluster_global_indices]
+            centroid = np.mean(Z_cluster, axis=0)
+            
+            dists = np.linalg.norm(Z_cluster - centroid, axis=1)
+            j = cluster_global_indices[np.argmin(dists)]
+            P[cluster_global_indices, j] = 1.0
 
-        # 第一部分：普通节点的聚类映射 (填充前 n_clusters_normal 列)
-        for i, normal_idx in enumerate(normal_indices):
-            cluster_id = cluster_labels[i]  # 标签从1开始转为0开始
-            P[normal_idx, cluster_id] = 1.0
+        for ctrl_idx in ctrl_indices:
+            P[ctrl_idx, ctrl_idx] = 1.0
 
-        # 第二部分：Controller 节点的一对一保留 (填充后续列)
-        for i, ctrl_idx in enumerate(ctrl_indices):
-            target_col = n_clusters_normal + i
-            P[ctrl_idx, target_col] = 1.0
-
-        # 7. 计算降维后的物理矩阵
-        M_hat = P.T @ M_sp @ P
-        D_hat = P.T @ D_sp @ P
-        L_hat = P.T @ L_sp @ P
-
-        print(f"Reduction done: {n} nodes ({n_ctrl} ctrl) -> {total_reduced_nodes} nodes. "
-                     f"Normal nodes compressed from {n_normal} to {n_clusters_normal}.")
-
-        return P, M_hat, D_hat, L_hat
+        return P
 
     def _constrained_hierarchical_clustering_vectorized(self, Z_normal, edge_src, edge_dst, n_nodes, node_types=None):
         """
@@ -213,55 +251,142 @@ class FastAdaptiveNetworkReducer:
         Returns:
             cluster_labels: 每个节点的聚类标签
         """
-        # =================================================================
-        # 1. 向量化计算所有边的距离
-        # =================================================================
-        Z_src = Z_normal[edge_src]  # [n_edges, k]
-        Z_dst = Z_normal[edge_dst]  # [n_edges, k]
-        edge_distances = np.linalg.norm(Z_src - Z_dst, axis=1)  # [n_edges]
+        Z_src = Z_normal[edge_src]
+        Z_dst = Z_normal[edge_dst]
+        edge_distances = np.linalg.norm(Z_src - Z_dst, axis=1)
+
+        dist_threshold = np.percentile(edge_distances, 10)
+
+        # 3. 构造类型一致性约束 + 物理连接约束
+        type_mask = (node_types[edge_src] == node_types[edge_dst])
+        valid_u = edge_src[type_mask]
+        valid_v = edge_dst[type_mask]
         
-        # =================================================================
-        # 2. 应用 type 约束：只保留 type 相同的边
-        # =================================================================
-        if node_types is not None:
-            type_src = node_types[edge_src]
-            type_dst = node_types[edge_dst]
-            type_mask = (type_src == type_dst)
-            
-            # 过滤掉 type 不同的边
-            edge_src = edge_src[type_mask]
-            edge_dst = edge_dst[type_mask]
-            edge_distances = edge_distances[type_mask]
+        # 构造连接矩阵（只有相连且同类型的点才能合并）
+        connectivity = sp.coo_matrix(
+            (np.ones(len(valid_u)), (valid_u, valid_v)),
+            shape=(n_nodes, n_nodes)
+        )
+
+        # 4. 执行层次聚类
+        # n_clusters=None 必须配合 distance_threshold 使用
+        # linkage='average' (平均距离) 比之前的连通分量法能有效防止“一锅端”
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=dist_threshold,
+            connectivity=connectivity,
+            linkage='average' 
+        )
         
-        # =================================================================
-        # 3. 计算自适应阈值
-        # =================================================================
-        if len(edge_distances) > 0:
-            t_cutoff = np.percentile(edge_distances, 70)
-        else:
-            t_cutoff = float('inf')
-        
-        # =================================================================
-        # 4. 构建约束邻接矩阵（只保留距离小于阈值的边）
-        # =================================================================
-        valid_mask = edge_distances <= t_cutoff
-        valid_src = edge_src[valid_mask]
-        valid_dst = edge_dst[valid_mask]
-        
-        # 构建稀疏邻接矩阵（对称）
-        n_valid = len(valid_src)
-        data = np.ones(n_valid * 2, dtype=np.float32)
-        rows = np.concatenate([valid_src, valid_dst])
-        cols = np.concatenate([valid_dst, valid_src])
-        constrained_adj = sp.csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
-        
-        # =================================================================
-        # 5. 使用并查集/连通分量算法进行聚类
-        #    这等价于贪心合并，但用高效的图算法实现
-        # =================================================================
-        n_components, labels = connected_components(constrained_adj, directed=False, return_labels=True)
-        
-        logging.info(f"Constrained clustering: {n_nodes} nodes -> {n_components} clusters, "
-                     f"threshold={t_cutoff:.4f}, valid_edges={n_valid}")
-        
+        labels = model.fit_predict(Z_normal)
+
+        # --- 新增：打印普通节点的压缩情况 ---
+        n_clusters = len(np.unique(labels))
+        reduction_pct = (1 - n_clusters / n_nodes) * 100
+        print(f"\n[Clustering Detail]")
+        print(f" - Normal Nodes: {n_nodes} -> {n_clusters}")
+        print(f" - Reduction Ratio: {reduction_pct:.2f}%")
+        print(f" - Adaptive Threshold: {dist_threshold:.6f}")
+
         return labels
+
+
+class RandomReducer:
+    def __init__(self, ratio=0.5, seed=None):
+        """
+        随机Reducer，对普通节点进行随机合并
+        
+        :param ratio: 最终保留的普通节点比例，默认0.5
+        :param seed: 随机种子，用于可重复性
+        """
+        self.ratio = ratio
+        self.seed = seed
+
+    def reduce(self, m_vector, m_gs, spring_Y, d_dashpot, d_drag, node_type):
+        """
+        执行随机降维
+        
+        Args:
+            m_vector: 节点质量向量 [n]
+            m_gs: 边的连接关系 [2, n_edges]
+            spring_Y: 弹簧刚度系数 [n_edges]
+            d_dashpot: 阻尼系数
+            d_drag: 阻力系数
+            node_type: 节点类型数组 [n]，type==3 为 controller
+        
+        Returns:
+            P: 投影矩阵 [n, n]
+            M_hat: 降维后的质量矩阵 [n, n]
+            D_hat: 降维后的阻尼矩阵 [n, n]
+            L_hat: 降维后的拉普拉斯矩阵 [n, n]
+        """
+        st_global = time()
+        n = len(m_vector)
+        
+        # 1. 识别节点角色
+        # node_type == 3 为 controller
+        ctrl_indices = np.where(node_type == 3)[0]
+        normal_indices = np.where(node_type != 3)[0]
+        
+        n_ctrl = len(ctrl_indices)
+        n_normal = len(normal_indices)
+        
+        if n_normal <= 1:
+            logging.warning("No normal nodes to reduce or system too small.")
+            return np.eye(n), None, None, None
+
+        # 2. 构建物理矩阵（使用提供的 sparse 构建函数）
+        M_sp, D_sp, L_sp = build_physical_matrices_sparse(m_vector, 
+                                                          m_gs, 
+                                                          spring_Y, 
+                                                          d_dashpot, 
+                                                          d_drag)
+
+        # 3. 对 normal 节点进行随机合并
+        # 设置随机种子以保证可重复性
+        rng = np.random.RandomState(self.seed)
+        
+        # 计算要保留的目标节点数量
+        target_count = max(1, int(n_normal * self.ratio))
+        
+        # 从 normal 节点中随机选择目标节点索引
+        target_indices = rng.choice(n_normal, size=target_count, replace=False)
+        target_indices.sort()
+        
+        # 创建映射数组：每个 normal 节点映射到一个目标节点
+        # -1 表示该节点是目标节点本身
+        mapping = np.full(n_normal, -1, dtype=np.int64)
+        
+        # 将非目标节点随机分配到目标节点
+        non_target_indices = np.setdiff1d(np.arange(n_normal), target_indices)
+        if len(non_target_indices) > 0:
+            # 随机分配到各个目标节点
+            assignments = rng.randint(0, target_count, size=len(non_target_indices))
+            for i, nt_idx in enumerate(non_target_indices):
+                mapping[nt_idx] = target_indices[assignments[i]]
+        
+        # 4. 构建投影矩阵 P [n x n]
+        P = np.eye(n)
+        
+        # 设置非目标节点的映射：将这些节点合并到对应的目标节点
+        for i, normal_idx in enumerate(normal_indices):
+            if mapping[i] >= 0:
+                # 该节点需要合并到目标节点
+                target_normal_idx = normal_indices[mapping[i]]
+                P[normal_idx, target_normal_idx] = 1.0
+                P[normal_idx, normal_idx] = 0.0
+
+        # import pdb; pdb.set_trace()
+
+        # # 5. 计算降维后的物理矩阵
+        # M_hat = P.T @ M_sp @ P
+        # D_hat = P.T @ D_sp @ P
+        # L_hat = P.T @ L_sp @ P
+
+        elapsed = time() - st_global
+        actual_reduced = n - len(non_target_indices) if len(non_target_indices) > 0 else n
+        logging.info(f"Random Reduction done: {n} nodes ({n_ctrl} ctrl) -> {actual_reduced} nodes. "
+                     f"Normal nodes compressed from {n_normal} to {target_count}. "
+                     f"Time: {elapsed:.3f}s")
+
+        return P

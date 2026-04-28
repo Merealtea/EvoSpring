@@ -10,7 +10,7 @@ from End2End_Reduction_Dataset import End2EndReductionDataset
 import math
 import numpy as np
 import os
-from Reducer import FastAdaptiveNetworkReducer
+from Reducer import FastAdaptiveNetworkReducer, RandomReducer, build_physical_matrices_sparse
 import warp as wp
 from time import time
 import pickle
@@ -38,7 +38,7 @@ class E2EReductionTrainer:
         # 初始化 Warp 优化器（仅在训练模式且 collision_learn 开启时）
         # Update without warp, only by NN for multilayer design
         self.optimizer = torch.optim.Adam(self.model.parameters(), 
-                                          lr=self.args.lr * min(np.sqrt(cfg.train_frame), 2), 
+                                          lr=self.args.lr * min(np.sqrt(cfg.train_frame), 1), 
                                           betas=(0.9, 0.99))
 
         self.epochs_per_stage = 20
@@ -64,8 +64,7 @@ class E2EReductionTrainer:
         self.writer = SummaryWriter(os.path.join(self.save_base_dir, 'log'))
 
         self.total_update = 0
-        self.reducer = FastAdaptiveNetworkReducer(num_modes=500)
-
+        
         # 每个阶段独立跟踪最佳结果
         self.stage_best_losses = []  # 每个阶段的最佳 loss 列表
         self.stage_best_mech_info = []  # 每个阶段的最佳 mech_info 列表
@@ -81,12 +80,20 @@ class E2EReductionTrainer:
         
         # 全局最佳结果（用于下采样时参考）
         self.global_best_loss = float('inf')
-        self.global_best_mech_info = None
+        self.global_best_mech_info = []
         self.global_best_epoch = None
         self.global_best_iteration = None
 
         self.mlvl_simulators = []
         self.mlvl_collide_optimizer = []
+        if args.reduction == 'learnable':
+            self.use_reduction_downsample = False
+        elif args.reduction == 'reduction_order':
+            self.use_reduction_downsample = True
+            self.reducer = FastAdaptiveNetworkReducer(num_modes=500)
+        elif args.reduction == 'random':
+            self.use_reduction_downsample = True
+            self.reducer = RandomReducer(0.6)
 
     def create_simulator(self, stage):
         # create simulator here
@@ -141,6 +148,34 @@ class E2EReductionTrainer:
         self.mlvl_simulators.append(simulator)
         self.mlvl_collide_optimizer.append(collide_optimizer)
 
+    def downsample(self, stage_idx):
+        # 1. 启发式阈值设定：阶段越往后，允许合并的差异度越大
+
+        logger.info(f"Applying adaptive downsampling for Stage {stage_idx}...")
+        
+        node_mass = self.m_masses[-1].cpu().numpy()
+        gs = self.m_gs[-1].cpu().numpy()
+
+        gs = gs[:, :len(gs[0])//2]
+
+        # 获取全局最优的力学参数
+        best_mech = self.stage_best_mech_info[stage_idx]
+        spring_Y = np.exp(best_mech['log_spring_Y'].cpu().numpy())
+        drag_damping = best_mech['drag_damping'].item()
+        dashpot_damping = best_mech['dashpot_damping'].item()
+
+        node_type = self.m_node_type[-1].cpu().numpy()
+
+        # 2. 调用自适应降维器进行聚类
+        # reducer 内部会将物理参数转换为 M, D, L 矩阵并进行格拉姆矩阵聚类
+        P_np = self.reducer.reduce(
+            node_mass, gs, spring_Y, dashpot_damping, drag_damping, node_type
+        )
+
+        # 保存投影矩阵 P，供神经网络 Forward 过程聚合特征使用
+        P_tensor = torch.tensor(P_np, device=cfg.device).float()
+        self.m_proj.append(P_tensor)
+      
     def export_multi_level_obj(self, save_dir="exported_meshes"):
         """
         将每一层降维后的图结构（顶点和边）导出为标准的 .obj 文件。
@@ -685,7 +720,7 @@ class E2EReductionTrainer:
         # 分阶段训练
         for stage in range(self.num_stages):
             # DEBUG(CXY)
-            if stage >= 1:
+            if stage >= 3:
                 break
 
             self.current_stage = stage
@@ -696,7 +731,7 @@ class E2EReductionTrainer:
             # 注意：downsample 是在模型 forward 中通过 pooling 操作实现的
             # 每个 stage 对应模型输出的一层，不需要手动执行 downsample
             # 模型 forward 会返回所有层的输出和 pooling_losses
-            
+
             # 训练当前阶段的所有 epoch
             for epoch in range(self.epochs_per_stage):
                 global_epoch = stage * self.epochs_per_stage + epoch
@@ -705,13 +740,35 @@ class E2EReductionTrainer:
                 # 运行 epoch，只监督当前层
                 self.run_epoch(epoch, mode='train', stage=stage)
                 
+                # 保存当前 epoch 的模型参数
+                epoch_checkpoint = {
+                    'epoch': epoch,
+                    'stage': stage,
+                    'global_epoch': global_epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'stage_best_losses': self.stage_best_losses,
+                    'stage_best_epochs': self.stage_best_epochs,
+                    'stage_best_iterations': self.stage_best_iterations,
+                    'global_best_loss': self.global_best_loss,
+                }
+                epoch_ckpt_filename = f'stage{stage}_epoch{epoch}_global{global_epoch}_model_checkpoint.pth'
+                epoch_ckpt_path = os.path.join(self.save_base_dir, 'ckpts', epoch_ckpt_filename)
+                torch.save(epoch_checkpoint, epoch_ckpt_path)
+                logger.info(f"Saved model checkpoint for Stage {stage}, Epoch {epoch} to {epoch_ckpt_path}")
+                
                 # 更新进度条
                 self.pbar.update(1)
-            
+
             # # 保存当前阶段的最佳结果
             self._save_stage_result(stage)
+
             # 合并所有阶段的最佳结果为 global_best
             self._merge_stage_results()
+
+            if self.use_reduction_downsample:
+                self.downsample(stage)
+            
             logger.info(f"Stage {stage} completed. Best loss: {self.stage_best_losses[stage]:.6f}")
         
         # 所有阶段训练完成后，导出和可视化
@@ -1130,7 +1187,8 @@ class E2EReductionTrainer:
                     self.m_masses,
                     self.m_node_type,
                     node_in_feature,
-                    object_radius
+                    object_radius,
+                    self.global_best_mech_info
                 )
                 
                 # 在分阶段训练中，只使用当前阶段的 pooling loss
@@ -1168,9 +1226,11 @@ class E2EReductionTrainer:
                 wp_predicted_spring_Y = wp.from_torch(
                     log_new_spring_Y.contiguous(), dtype=wp.float32, requires_grad=True
                 )
+
                 wp_predicted_drag_damping = wp.from_torch(
                     level_info['drag_damping'], dtype=wp.float32, requires_grad=True
                 )
+                    
                 wp_predicted_dashpot_damping = wp.from_torch(
                     level_info['dashpot_damping'], dtype=wp.float32, requires_grad=True
                 )
