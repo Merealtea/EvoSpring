@@ -1,3 +1,3 @@
 python evaluate_global_chamfer.py
 python evaluate_global_track.py
-# python gaussian_splatting/evaluate_render.py
+# python gaussian_splatting/evaluate_render_multi_stage.py

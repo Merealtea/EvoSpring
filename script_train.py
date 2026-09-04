@@ -1,13 +1,18 @@
 import glob
 import os
 import json
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--local_rank", type=int, default=0)
+args = parser.parse_args()
 
 case = "End2End_Reduction" # 'neural_spring_field' # "evospring" # End2End # End2End_Reduction
 CONFIG_FILE=f"./configs/{case}"
 # 0: train 1: local test 2: global
 MODE=0
 RESTART_EPOCH=-1
-local_rank=1
+local_rank=args.local_rank
 
 # Load config file (key=value format)
 config = {}
@@ -30,15 +35,29 @@ if not os.path.exists(base_path):
     exit(1)
 
 dir_names = os.listdir(base_path)
+exclusive_cases = []
 finished_cases = os.listdir(res_path)
 
 # dir_names = ['double_lift_cloth_1', 'double_lift_cloth_3', 'rope_double_hand', 'single_lift_zebra', 'single_push_rope_4', 'single_lift_cloth_4', 'single_push_rope_1'] # small batch test
 # dir_names = ['weird_package', 'single_lift_cloth_4']
 # exclusive_cases = ['single_clift_cloth_3'] #, 'double_lift_cloth_1', 'double_stretch_sloth', 'single_lift_rope', 'double_lift_cloth_3', 'single_lift_cloth_3', 'rope_double_hand', 'double_lift_zebra', 'double_lift_sloth']
+# exclusive_cases = ['cloth3_0001', 'T_export'] #, 'double_lift_cloth_1', 'double_stretch_sloth', 'single_lift_rope', 'double_lift_cloth_3', 'single_lift_cloth_3', 'rope_double_hand', 'double_lift_zebra', 'double_lift_sloth']
+# dir_names = [ 'single_lift_cloth_3', 'rope_double_hand',
+#             'single_lift_cloth_4', 'single_push_rope_1', 'single_lift_cloth',
+#             'weird_package'] # seed 10
+
+# dir_names = ['single_lift_cloth_3', 'rope_double_hand', 'single_lift_dinosor', 'single_lift_cloth',
+#             'single_lift_cloth_4', 'single_push_rope_1', 'single_lift_cloth', 'single_push_rope',
+#             'single_clift_cloth_1', 'double_stretch_zebra'] # seed 100
+
+# dir_names = [ 'double_stretch_sloth'] # seed 100
+
+# Real2sim Cases
+# dir_names = ['T_export']
 for idx, case_name in enumerate(dir_names):
     # case_name = 'single_clift_cloth_3' # DEBUG
-    # if case_name in exclusive_cases:
-    #     continue
+    if case_name in exclusive_cases:
+        continue
     
     print(f"Running case: {case_name}")
     # if case_name in finished_cases:
@@ -53,7 +72,7 @@ for idx, case_name in enumerate(dir_names):
             -multi_mesh_layer {config['multi_mesh_layer']} -consist_mesh {config['consist_mesh']} \
             -num_epochs {config['num_epochs']} -batch {config['batch']} -lr {config['lr']} -gamma {config['gamma']} \
             -restart_epoch {RESTART_EPOCH} -mp_time {config['MP_time']} \
-            -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name} --reduction {config['reduction']}"
+            -data_dir {config['data_dir']} -dump_dir {config['dump_dir']} -mode {MODE} -object_case {case_name} -reduction {config['reduction']}"
     )
 
     # if idx == 5: 

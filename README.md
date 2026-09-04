@@ -1,119 +1,105 @@
-# EvoMesh (ICML 2025)
-About code release of "EvoMesh: Adaptive Physical Simulation with Hierarchical Graph Evolutions", ICML 2025
-[[Arxiv]](https://arxiv.org/abs/2410.03779) [[Project Page]](https://hbell99.github.io/evo-mesh/).
+# Physpring
 
-Graph neural networks have been a powerful tool for mesh-based physical simulation. To efficiently model large-scale systems, existing methods mainly employ hierarchical graph structures to capture multi-scale node relations. However, these graph hierarchies are **typically manually designed and fixed**, limiting their ability to adapt to the evolving dynamics of complex physical systems. We propose EvoMesh, a fully differentiable framework that **jointly learns graph hierarchies and physical dynamics, adaptively guided by physical inputs.** EvoMesh introduces anisotropic message passing, which enables direction-specific aggregation of dynamic features between nodes within each hierarchy, while simultaneously learning node selection probabilities for the next hierarchical level based on physical context. This design creates more flexible message shortcuts and enhances the model's capacity to capture long-range dependencies. 
+> Physpring: Differentiable Spring-Mass Simulation for Estimating Mechanical Properties of Deformable Objects.
 
-<p align="center">
-<img src=".\pic\comparison.png" height = "250" alt="" align=center />
-<br><br>
-<b>Figure 1.</b> Comparison of mesh-based physical simulation models. Dynamic hierarchy refers to hierarchical graph structures that evolve over time. Adaptive indicates that the graph structures are determined by physical inputs. Prop. denotes feature propagation.
-</p>
+Physpring is a **fully differentiable framework** that learns the **mechanical properties** (spring stiffness and damping) of deformable objects such as cloth and ropes. It combines a graph neural network (GNN) built on the [EvoMesh](https://arxiv.org/abs/2410.03779) backbone with the [NVIDIA Warp](https://github.com/NVIDIA/warp) differentiable simulator (`SpringMassSystemWarp`) to identify per-spring physical parameters from observed point-cloud / mesh trajectories.
 
 
-<p align="center">
-<img src=".\pic\EvoMesh.png" height = "250" alt="" align=center />
-<br><br>
-<b>Figure 2.</b> Overview of EvoMesh.
-</p>
+## Environment Requirements
 
-## Requirements
+- Ubuntu 22.04
+- Python 3.10
+- CUDA 12.8
 
-- Pytorch
-- PyG
-- Numpy
-- h5py
-- TensorBoard
-- SciPy
-- scikit-learn
-- sparse-dot-mkl
-
-
-## Datasets
-
-
-Please follow the instruction of [MeshGrahNet](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets) to download datasets. To convert your TensorFlow dataset (`.tfrecord`) into HDF5 files (`.h5`), modify the paths for `tf_dataset` and `root` in the corresponding config. For example, for the cylinderflow dataset, modify `TF_DATASET_PATH` and `SAVE_ROOT`,  to point to your TensorFlow dataset directory and desired output directory. Then, run the following command:
+Install the environment with the following commands:
 
 ```bash
-python misc/parse_tfrecord.py
+conda create -n physpring python=3.10 -y
+conda activate physpring
+bash env_install/env_install.sh
 ```
 
-Please maintain the file structure shown below to run the script by default.
+`env_install/env_install.sh` installs the CUDA 12.8 toolkit, PyTorch 2.8 (cu128), NVIDIA Warp, and compiles the Gaussian Splatting CUDA extensions.
 
-```sh
-|───data
-│   └───cylinder
-|       └───outputs_test
-|       └───outputs_train
-|       └───outputs_valid
-│       │   meta.json
-│   └───...
+## Datasets Preparation
+
+Follow the instruction from PhysTwin to download the datasets and struture them into the project's root folder.
+
+- [data](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/data.zip): this includes the original data for different cases and the processed data for quick run. The different case_name can be found under `different_types` folder.
+- [experiments_optimization](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/experiments_optimization.zip): results of our first-stage zero-order optimization.
+- [experiments](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/experiments.zip): results of our second-order optimization.
+- [gaussian_output](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/gaussian_output.zip): results of our static gaussian appearance.
+
+The final folder struture is like this
+
+```
+PhySpring/
+├── ...
+├── data/
+├── experiments/
+├── experiments_optimization/
+└── gaussian_output/
+└── ...
 ```
 
-## Pretrained Weights
+Then transfer data for the PhySpring model input format in 'evomesh_optimization_outputs' folder
+```bash
+python ./tools/phystwin_2_evomesh.py
 
-The pretrained weights can be download from this [link](https://drive.google.com/drive/folders/1jGA2M5Vahc_d9WZJ6_Ov6TBZSM_RsBKD?usp=sharing).
+```
 
 ## Training
 
-```sh
-# ./run.sh $case_name ./configs/$case_name $mode $restart_epoch
+Train all scenes and the result will be stored in './res/End2End_Reduction'
 
-# case_name: [cylinder, flag]
-# ./configs/$case_name: stores the corresponding config files of a case
-# mode: [0:train, 1:local test, 2: global rollout]
-# restart_epoch: -1 (or leave blank) to train from the start; 0, 1... to reload the stored ckpts of a certain frame
-
-# e.g. train font from scratch
-./run.sh cylinder ./configs/cylinder 0 -1
-# e.g. local test RMSE of cylinder at epoch 19
-./run.sh cylinder ./configs/cylinder 1 19
-# e.g. global rollout RMSE of airfoil at epoch 39
-./run.sh flag ./configs/airfoil 2 39
+```bash
+python script_train.py --local_rank 0
 ```
 
+You can assign the device by change the parameters local rank 
 
-## Results
-
-EvoMesh consistently outperforms the compared mod- els across all benchmarks.
-
-<p align="center">
-<img src=".\pic\results.png" height = "250" alt="" align=center />
-<br><br>
-<b>Table 1.</b> Results on four datasets.
-</p>
+## Evaluating Spring Mass Chamfer Loss and Tracking Loss
 
 
-## Showcases
-<p align="center">
-<img src=".\pic\showcase1.png" height = "250" alt="" align=center />
-<br><br>
-<b>Figure 3.</b> Prediction showcases over 400 future steps on CylinderFlow.
-</p>
+```bash
+bash evaluate_global.sh
+```
 
+The chamfer loss and tracking loss in the './results/final_global_results.csv' and './results/final_global_track.csv'
 
-## Poster
+## Evaluating Rendering Loss
 
-<p align="center">
-<img src="./pic/poster.png" height = "300" alt="" align=center />
-</p>
+Render predicted dynamics and convert frames to video:
 
+```bash
+# Use LBS to render the dynamic videos (The final videos in ./gaussian_output_dynamic folder)
+bash gs_run_simulate_multi_stage.sh
+python export_render_eval_data_multi_stage.py
+# Get the quantative results
+bash evaluate_global.sh
+
+# Get the qualitative results
+bash gs_run_simulator_white_multi_stage.sh
+python visualize_render_results_multi_stage.py
+```
+## Real2sim Deployment
+
+You can export the phystwin assets into real2sim simulation for robot grasp and place.
+
+Follow the readme in [Real2sim-extent repo](https://github.com/Merealtea/Real2sim-eval-extend)
 
 ## Citation
 
-If you find this repo useful, please cite our paper. 
-
 ```
-@inproceedings{
-    deng2025evomesh,
-    title={EvoMesh: Adaptive Physical Simulation with Hierarchical Graph Evolutions},
-    author={Huayu Deng and Xiangming Zhu and Yunbo Wang and Xiaokang Yang},
-    booktitle={Forty-second International Conference on Machine Learning},
-    year={2025},
-    url={https://openreview.net/forum?id=ZZvTc92dYQ}
+@inproceedings{physpring,
+    title={Physpring: Differentiable Spring-Mass Simulation for Estimating Mechanical Properties of Deformable Objects},
+    author={TODO},
+    booktitle={TODO},
+    year={TODO},
+    url={TODO},
 }
 ```
 
 ## Credits
 
-The codes refer to the implemention of [BSMS-GNN](https://github.com/Eydcao/BSMS-GNN). Thanks for the authors！
+The codes refer to the implementation of [EvoMesh](https://github.com/hbell99/evo-mesh) and [PhysTwin](https://github.com/jianghanxiao/phystwin). Thanks to the authors!

@@ -16,7 +16,7 @@ class MODE(Enum):
 
 def getargs():
     parser = argparse.ArgumentParser(description='self.Args for training')
-    parser.add_argument("--local_rank", type=int, default=0,) 
+    parser.add_argument("-local_rank", type=int) 
     parser.add_argument('-case', type=str, help='cylinder/aero/plate/Font')
     parser.add_argument('-data_dir', type=str, help='/data_dir/outputs_train(or valid, test)/. contains the datas')
     parser.add_argument('-dump_dir', type=str, help='/dump_dir/*method/ to store ckpts, logs, trajs etc')
@@ -81,7 +81,8 @@ if __name__ == "__main__":
     device = torch.device("cuda", args.local_rank)
 
     wp.init()
-    wp.set_device("cuda:0")
+
+    wp.set_device(str(device))
     if not cfg.use_graph:
         wp.config.mode = "debug"
         wp.config.verbose = True

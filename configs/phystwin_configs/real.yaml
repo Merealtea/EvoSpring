@@ -4,7 +4,7 @@ dt: 5e-5
 num_substeps: 667
 dashpot_damping: 100
 drag_damping: 3
-base_lr: 1e-3
+base_lr: 5e-4
 iterations: 200
 vis_interval: 20
 init_spring_Y: 3e4

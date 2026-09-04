@@ -1,12 +1,13 @@
 ninja_required_version = 1.3
-cxx = c++
-nvcc = /usr/local/cuda-12.0/bin/nvcc
+cxx = /home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/bin/x86_64-conda-linux-gnu-g++
+nvcc = /home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/bin/nvcc
 
-cflags = -pthread -B /home/cxy/miniconda3/envs/phystwin/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/cxy/miniconda3/envs/phystwin/include -fPIC -O2 -isystem /home/cxy/miniconda3/envs/phystwin/include -fPIC -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/TH -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/THC -I/usr/local/cuda-12.0/include -I/home/cxy/miniconda3/envs/phystwin/include/python3.10 -c
-post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_C -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17
-cuda_cflags = -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/TH -I/home/cxy/miniconda3/envs/phystwin/lib/python3.10/site-packages/torch/include/THC -I/usr/local/cuda-12.0/include -I/home/cxy/miniconda3/envs/phystwin/include/python3.10 -c
-cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_C -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 -std=c++17
+cflags = -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include -fPIC -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/lib/python3.10/site-packages/torch/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include/python3.10 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1018"' -DTORCH_EXTENSION_NAME=_C -std=c++17
+cuda_cflags = -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/lib/python3.10/site-packages/torch/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include -I/home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/include/python3.10 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1018"' -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -ccbin /home/yj401@ad.eng.cam.ac.uk/miniconda3/envs/physpring/bin/x86_64-conda-linux-gnu-gcc -std=c++17
 cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
 ldflags = 
 
 rule compile
@@ -23,9 +24,13 @@ rule cuda_compile
 
 
 
-build /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o: compile /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/ext.cpp
-build /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o: cuda_compile /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/simple_knn.cu
-build /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o: cuda_compile /mnt/pool1/cxy/phystwin-v2/EvoSpring/src/gaussian_splatting/submodules/simple-knn/spatial.cu
+
+
+build /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o: compile /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/ext.cpp
+build /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o: cuda_compile /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/simple_knn.cu
+build /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o: cuda_compile /home/yj401@ad.eng.cam.ac.uk/cxy/Physpring/EvoSpring/src/gaussian_splatting/submodules/simple-knn/spatial.cu
+
+
 
 
 

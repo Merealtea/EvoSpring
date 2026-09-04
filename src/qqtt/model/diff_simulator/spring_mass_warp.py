@@ -3,27 +3,29 @@ import numpy as np
 from qqtt.utils import logger, cfg
 import warp as wp
 
-# 兼容不同的 Warp 版本路径 (新版大多在 _src 目录下)
-try:
-    import warp._src.utils
-    warp_module = warp._src.utils
-except ImportError:
-    import warp.utils
-    warp_module = warp.utils
+# Warp 1.14+ 使用 Logger 协议代替了旧的 warn 函数
+# 通过自定义 Logger 屏蔽 "Running the tape backwards" 警告
+class _SuppressTapeWarningsLogger:
+    """包装默认 Logger，静默丢弃 tape backwards 警告。"""
 
-# 1. 备份 Warp 原始的 warn 函数
-original_warn = warp_module.warn
+    def __init__(self):
+        self._default = wp._src.utils.LoggerBasic()
 
-# 2. 伪造一个我们自己的 warn 函数
-def custom_warn(message, category=None, stacklevel=1, once=False):
-    # 如果发现是那个烦人的 tape 警告，直接 return 丢弃掉，当无事发生
-    if "Running the tape backwards" in str(message):
-        return  
-    # 其他的警告则乖乖放行，照常调用原始函数
-    original_warn(message, category, stacklevel, once)
+    def debug(self, message: str) -> None:
+        self._default.debug(message)
 
-# 3. 狸猫换太子：强行把 Warp 内部的 warn 替换成我们自定义的函数
-warp_module.warn = custom_warn
+    def info(self, message: str) -> None:
+        self._default.info(message)
+
+    def warning(self, message: str, category=None, stacklevel: int = 1) -> None:
+        if "Running the tape backwards" in str(message):
+            return
+        self._default.warning(message, category, stacklevel + 1)
+
+    def error(self, message: str) -> None:
+        self._default.error(message)
+
+wp.set_logger(_SuppressTapeWarningsLogger())
 
 # wp.init()
 # wp.set_device("cuda:0")

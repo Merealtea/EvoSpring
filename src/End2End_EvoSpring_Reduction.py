@@ -210,11 +210,11 @@ class End2EndReduction_EvoSpring(ModelGeneral):
 
                 edges = downsample_results['down_gs'][lvl]
                 num_edges = edges.shape[1]
-                spring_Y_basis = -L_hat[edges[0], edges[1]][:num_edges//2]
+                spring_Y_basis = self.S_0 # -L_hat[edges[0], edges[1]][:num_edges//2]
                 dashpot_array = -D_hat[edges[0], edges[1]]
-                new_dashpot_basis = torch.mean(dashpot_array) 
+                new_dashpot_basis = self.dashpot_damping_0 # torch.mean(dashpot_array) 
                 drag_array = torch.sum(D_hat, axis=1)
-                new_drag_basis = torch.mean(drag_array)
+                new_drag_basis = self.drag_damping_0 # torch.mean(drag_array)
 
                 # 将提取的参数转为 Tensor 保存
                 drag_damping_out = new_drag_basis + self.drag_damping_bias[lvl] * 100
@@ -222,8 +222,8 @@ class End2EndReduction_EvoSpring(ModelGeneral):
                 s_out = ((spring_Y_basis + edge_mech_in_bias * 1e3))
 
             else:
-                # 2. predict drag_damping bias
-                # # Return spring stiffness and damping parameters (default + learnable bias)
+            # 2. predict drag_damping bias
+            # Return spring stiffness and damping parameters (default + learnable bias)
                 drag_damping_out = self.drag_damping_0 + self.drag_damping_bias[lvl] * 100
                 dashpot_damping_out = self.dashpot_damping_0 + self.dashpot_damping_bias[lvl] * 100
                 s_out = ((self.S_0 + edge_mech_in_bias * 1e3))

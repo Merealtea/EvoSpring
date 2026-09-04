@@ -41,7 +41,7 @@ class E2EReductionTrainer:
                                           lr=self.args.lr * min(np.sqrt(cfg.train_frame), 1), 
                                           betas=(0.9, 0.99))
 
-        self.epochs_per_stage = 20
+        self.epochs_per_stage = 20 # 20
         self.iter_per_epoch = 10
         
         # 分阶段训练相关变量
@@ -86,6 +86,7 @@ class E2EReductionTrainer:
 
         self.mlvl_simulators = []
         self.mlvl_collide_optimizer = []
+        
         if args.reduction == 'learnable':
             self.use_reduction_downsample = False
         elif args.reduction == 'reduction_order':
@@ -279,12 +280,7 @@ class E2EReductionTrainer:
         )
 
         self.model.to(self.args.local_rank)
-        # self.model = nn.parallel.DistributedDataParallel(
-        #     self.model.cuda(self.args.local_rank),
-        #     device_ids=[self.args.local_rank],
-        #     output_device=self.args.local_rank,
-        #     find_unused_parameters=True  # [关键修复] 允许部分参数不参与计算
-        # )
+
 
     def _create_dataset_offline(self, mode='train', stride=1):
         if mode == 'train':
@@ -540,7 +536,34 @@ class E2EReductionTrainer:
         self.m_gt_object_motions_valid = [mdata.object_motions_valid.clone().to(cfg.device)]
 
 
-    
+    def _compute_abs_node_ids(self, stage: int):
+        """计算当前 stage 每个节点在 stage 0（第一层）中的绝对索引。
+
+        self.m_ids[l] 存储的是第 l 层节点在第 l-1 层中的索引（相对映射）。
+        要得到绝对索引，需要把从当前 stage 到 stage 0 的所有映射链式组合。
+
+        例如 stage=3 的第 i 个节点:
+            idx = self.m_ids[3][i]           # -> stage 2 中的索引
+            idx = self.m_ids[2][idx]         # -> stage 1 中的索引
+            idx = self.m_ids[1][idx]         # -> stage 0 中的索引
+
+        Args:
+            stage: 当前 stage 编号
+
+        Returns:
+            list[int]: 每个节点在 stage 0 中的绝对索引，长度 = 当前 stage 的节点数
+        """
+        # 从当前层的本地索引开始 (0, 1, 2, ..., N-1)
+        abs_ids = torch.arange(len(self.m_ids[stage]), dtype=torch.long)
+
+        # 逐层向上映射：stage → stage-1 → ... → stage 0
+        for l in range(stage, 0, -1):
+            mapping = torch.tensor(self.m_ids[l], dtype=torch.long)
+            abs_ids = mapping[abs_ids]
+
+        return abs_ids.tolist()
+
+
     def generate_data_point_sequence(self, simulator, update_frame_num, enable_backward=False):
         vertices_sequence = []
         velocities_sequence = []
@@ -720,7 +743,7 @@ class E2EReductionTrainer:
         # 分阶段训练
         for stage in range(self.num_stages):
             # DEBUG(CXY)
-            if stage >= 3:
+            if stage >= 4:
                 break
 
             self.current_stage = stage
@@ -1162,7 +1185,7 @@ class E2EReductionTrainer:
         pos_encoded = self.positional_encoding(normalized_train_node_pos, num_freq_bands=10)
         
         node_in_feature = torch.cat([
-            normalized_train_node_pos, pos_encoded,  train_node_mass, train_node_type
+            normalized_train_node_pos, pos_encoded, train_node_mass, train_node_type
         ], dim=1)
 
         if mode != 'train':
@@ -1362,6 +1385,7 @@ class E2EReductionTrainer:
                         
                         # 8. 节点 ID 映射（下采样索引）
                         'node_ids': self.m_ids[self.current_stage],
+                        'abs_node_ids': self._compute_abs_node_ids(self.current_stage),
                     }
                     
                     self.stage_best_mech_info[self.current_stage] = complete_stage_info

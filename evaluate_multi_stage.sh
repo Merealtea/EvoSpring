@@ -1,3 +1,0 @@
-python evaluate_multi_stage_chamfer.py
-python evaluate_multi_stage_track.py
-# python gaussian_splatting/evaluate_render.py

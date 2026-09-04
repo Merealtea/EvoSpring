@@ -119,7 +119,7 @@ class InvPhyTrainerWarp:
             controller_max_neighbours=cfg.controller_max_neighbours,
             mask=self.init_masks,
         )
-        import pdb; pdb.set_trace()   
+
         self.simulator = SpringMassSystemWarp(
             self.init_vertices,
             self.init_springs,

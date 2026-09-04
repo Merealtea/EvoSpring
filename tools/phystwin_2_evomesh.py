@@ -339,6 +339,7 @@ if __name__ == "__main__":
         params_file = os.path.join(param_file_path, obj_case, "optimal_params.pkl")
         split_file = os.path.join(opt_file_path, obj_case, "split.json")
         mech_file = os.path.join(mech_gt_path, obj_case, "train")
+        
         for mech_gt_file in os.listdir(mech_file):
             if mech_gt_file.startswith('best'):
                 mech_file = os.path.join(mech_file, mech_gt_file)
