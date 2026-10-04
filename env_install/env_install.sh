@@ -8,7 +8,7 @@ conda install -c conda-forge gxx_linux-64=10 gcc_linux-64=10 -y
 
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 
-pip install -y numpy==1.26.4
+pip install numpy==1.26.4
 pip install "scipy<=1.15.3" --no-cache-dir --force-reinstall
 
 pip install warp-lang
